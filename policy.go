@@ -29,7 +29,7 @@ type AuthorizationPolicy struct {
 	OUMapping         map[string]string          `json:"ou_mapping"`
 	GatewayNamespaces map[string]PolicyNamespace `json:"gateway_namespaces"`
 	// CapabilityParameters is the parameter default values map derived by gen-authz from
-	// capability.json. Key is "scheme:capability_id" (e.g., "varwof/gateway:admin:config").
+	// capability.json. Key is "scheme:capability_id" (e.g., "varwof/gateway-v1:admin:config").
 	CapabilityParameters map[string]map[string]any `json:"capability_parameters,omitempty"`
 }
 

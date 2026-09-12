@@ -126,10 +126,10 @@ func TestAuthorizeGrantsCarriesResidualObligations(t *testing.T) {
 	}
 }
 
-// CLC-v1 §3 wants <vendor>/<product>-v<major>.  The varwof registry's own
-// namespace predates that rule, so it is reported rather than shimmed.
-func TestLegacyVarwofIdentifierIsReported(t *testing.T) {
-	_, err := ToGrant(capWith("varwof/core", "cert:issue", ""))
+// CLC-v1 §3 wants <vendor>/<product>-v<major>.  An identifier without the
+// version suffix is reported rather than shimmed into looking conformant.
+func TestUnversionedIdentifierIsReported(t *testing.T) {
+	_, err := ToGrant(capWith("acme/tools", "cert:issue", ""))
 	if err == nil {
 		t.Fatal("non-conformant identifier must be reported")
 	}

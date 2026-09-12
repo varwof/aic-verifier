@@ -464,6 +464,15 @@ func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
 		for _, cap := range result.AIC.Capabilities {
 			ac.Capabilities = append(ac.Capabilities, cap.CapabilityId)
 		}
+	} else if pa := result.PrincipalAuthorization; pa != nil {
+		// A human certificate carries no AIC extension: its authority is the
+		// PrincipalAuthorization extension (spec: enterprise privilege
+		// autonomy).  Surface those grants so downstream code sees what the
+		// caller was actually authorized with, instead of an empty list that
+		// reads as "no permissions" for a request that was just admitted.
+		for _, g := range pa.Grants {
+			ac.Capabilities = append(ac.Capabilities, g.CapabilityId)
+		}
 	}
 
 	// Mid-operation supervision (design draft §3, decision-path hook before
