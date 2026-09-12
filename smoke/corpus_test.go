@@ -170,6 +170,17 @@ func runVector(v vector) outcome {
 			o.Note = fmt.Sprintf("result_constraints want=%v got=%v", v.Expect.ResultConstraints, merged.Constraints)
 		}
 
+	case "subset":
+		o.Via = "clc-core(SubsetConstraints)"
+		ok, err := semantics.SubsetConstraints(v.Principal, v.Requested)
+		if err != nil {
+			o.GotVerdict, o.GotReason = "error", canonicalReason(err.Error())
+		} else if ok {
+			o.GotVerdict = "allow"
+		} else {
+			o.GotVerdict = "deny"
+		}
+
 	default:
 		o.Via = "n/a"
 		o.GotVerdict = "skip"
