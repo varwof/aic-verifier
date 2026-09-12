@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Jijie Wei (varwof)
+// SPDX-License-Identifier: Apache-2.0
+
 // Command smoke-verify runs a minimal aic-verifier-protected HTTP service
 // against a real varwof PKI (no demo CA), for smoke testing the SDK.
 package main
