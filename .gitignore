@@ -1,0 +1,12 @@
+# Build artifacts
+/mcp-server
+*.exe
+*.test
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

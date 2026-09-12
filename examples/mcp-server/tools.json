@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "db_query",
+      "description": "Run a read-only SQL statement against the demo catalog. The result row count is bounded by max_rows regardless of what the catalog contains.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "sql": { "type": "string", "minLength": 1, "maxLength": 200, "description": "read-only SELECT statement" },
+          "max_rows": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "hard cap on returned rows" }
+        },
+        "required": ["sql"]
+      },
+      "required_capability": "mcp:db_query",
+      "parameter_constraints": [
+        { "name": "sql", "pattern": "^SELECT ", "max_length": 200 },
+        { "name": "max_rows", "min": 1, "max": 1000 }
+      ]
+    },
+    {
+      "name": "trade_exec",
+      "description": "Place a market order. A single order amount is capped at 50000; the capability mcp:trade_exec is required.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "symbol": { "type": "string", "minLength": 1, "maxLength": 16 },
+          "side": { "type": "string", "enum": ["buy", "sell"] },
+          "amount": { "type": "number", "minimum": 1, "maximum": 50000 }
+        },
+        "required": ["symbol", "side", "amount"]
+      },
+      "required_capability": "mcp:trade_exec",
+      "parameter_constraints": [
+        { "name": "symbol", "pattern": "^[A-Z]{1,6}$", "max_length": 16 },
+        { "name": "side", "enum": ["buy", "sell"] },
+        { "name": "amount", "min": 1, "max": 50000 }
+      ]
+    }
+  ]
+}

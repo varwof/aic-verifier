@@ -1,0 +1,42 @@
+{
+  "_comment": "Compliance preset for aic-verifier (supervision + audit). Interfaces are code-injected: ApprovalRequester, OverrideRecorder and EvidenceExporter are wired in code and are NOT configured here. This file only turns the policy switches on and points the built-in supervision/audit stores at their log files. With all three switches true, startup fails if the matching interface is missing (newAuthenticator).",
+
+  "log_file": "/var/log/aicverifier.log",
+  "server": {
+    "read_timeout": "10s",
+    "read_header_timeout": "30s",
+    "write_timeout": "30s",
+    "idle_timeout": "120s",
+    "max_header_bytes": 1048576
+  },
+
+  "tls_cert_file": "server.crt",
+  "tls_key_file": "server.key",
+
+  "ca_cert_file": "ca.crt",
+  "jwt_ca_file": "jwt-ca.pem",
+  "jwt_issuer": "aic-verifier",
+  "jwt_audience": ["svc"],
+  "replay_protection": true,
+  "backend_root_ca": "backend-root.pem",
+
+  "auth_mode": "mtls_or_bearer",
+  "identity_mode": "forward_client_cert",
+
+  "require_aic": true,
+  "required_capabilities": ["ai:infer"],
+  "disallow_representative": true,
+  "require_user_auth": false,
+  "enforce_constraints": true,
+  "stream_body": false,
+
+  "supervision_policy": {
+    "require_runtime_approval": true,
+    "allow_break_glass": true,
+    "require_evidence_export": true
+  },
+
+  "audit_log_file": "/var/log/aic-verifier-audit.jsonl",
+  "audit_tsa_url": "https://tsa.example.com/rfc3161",
+  "supervision_log_file": "/var/log/aic-verifier-supervision.jsonl"
+}
