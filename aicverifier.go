@@ -101,6 +101,10 @@ type Config struct {
 	// part of the decision (CLC): an operation asking for more than the grant
 	// allows is denied.
 	RequiredOperations []Operation
+	// UnresolvedEvaluator is the §8.4 residual-obligation release hook for
+	// allow_unresolved CLC decisions; forwarded to PipelineConfig → AdmissionConfig.
+	// Set programmatically — not parsed from JSON.
+	UnresolvedEvaluator func(op Operation, unresolved []string) bool
 	// DisallowRepresentative rejects DelegationRepresentative-mode AIC.
 	DisallowRepresentative bool
 	// RequireUserAuth requires DelegationAuthorization signature verification.
@@ -309,6 +313,18 @@ type AuthContext struct {
 	Bearer bool
 	// Serial is the normalized client certificate serial.
 	Serial string
+	// Verdict is the overall CLC verdict for the requested operations (B3):
+	// "allow" when every operation was authorized outright, "allow_unresolved"
+	// when one or more carried §8.4 residual obligations (released or pending).
+	// Empty when no Operations were configured.
+	Verdict string
+	// Reason is the aggregated CLC reason for the verdict.
+	Reason string
+	// Unresolved lists recognized-but-unevaluated constraints carried by an
+	// allow_unresolved verdict (§8.4 residual-obligation channel).
+	Unresolved []string
+	// OperationDecisions is the per-operation CLC verdict detail (B3).
+	OperationDecisions []OperationDecision
 }
 
 type authCtxKey struct{}
@@ -438,6 +454,7 @@ func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
 		RequireAIC:               a.cfg.RequireAIC,
 		RequiredCapabilities:     a.cfg.RequiredCapabilities,
 		Operations:               a.cfg.RequiredOperations,
+		UnresolvedEvaluator:      a.cfg.UnresolvedEvaluator,
 		DisallowRepresentative:   a.cfg.DisallowRepresentative,
 		RequireUserAuth:          a.cfg.RequireUserAuth,
 		ClientIP:                 clientIPOf(r),
@@ -457,14 +474,18 @@ func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
 	}
 
 	ac := &AuthContext{
-		ClientCert: clientCert,
-		Principal:  result.Principal,
-		AgentID:    result.AgentId,
-		SPIFFEID:   result.SPIFFEID,
-		Roles:      result.Roles,
-		Serial:     result.Serial,
-		Bearer:     bearer,
-		AIC:        result.AIC,
+		ClientCert:         clientCert,
+		Principal:          result.Principal,
+		AgentID:            result.AgentId,
+		SPIFFEID:           result.SPIFFEID,
+		Roles:              result.Roles,
+		Serial:             result.Serial,
+		Bearer:             bearer,
+		AIC:                result.AIC,
+		Verdict:            result.CLCVerdict,
+		Reason:             result.CLCReason,
+		Unresolved:         result.CLCUnresolved,
+		OperationDecisions: result.OperationDecisions,
 	}
 	if result.AIC != nil {
 		for _, cap := range result.AIC.Capabilities {

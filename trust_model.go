@@ -114,6 +114,8 @@ func VerifyLayer2(chain []*x509.Certificate, cfg *PipelineConfig, roles []string
 		RequiredProtocol:          cfg.RequiredProtocol,
 		RequiredRuleId:            cfg.RequiredRuleId,
 		RequiredCapabilities:      cfg.RequiredCapabilities,
+		Operations:                cfg.Operations,
+		UnresolvedEvaluator:       cfg.UnresolvedEvaluator,
 		DisallowRepresentative:    cfg.DisallowRepresentative,
 		RequireUserPermission:     cfg.RequireUserPermission,
 		RejectOverflow:            cfg.RejectOverflow,

@@ -126,6 +126,20 @@ func TestAuthorizeGrantsCarriesResidualObligations(t *testing.T) {
 	}
 }
 
+// CLC-v1 §9.3 wants an absent/empty effective grant to short-circuit to
+// capability_not_authorized before the operation's layer-1 validation, so an
+// empty grant with an empty operation is not misreported as
+// missing_capability_id.
+func TestAuthorizeGrantsEmptyGrantPrecedesOperationValidation(t *testing.T) {
+	dec, err := AuthorizeGrants([]semantics.Grant{{}}, "", nil)
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if dec.Verdict != semantics.VerdictDeny || !strings.Contains(dec.Reason, "capability_not_authorized") {
+		t.Errorf("verdict=%q reason=%q, want deny capability_not_authorized", dec.Verdict, dec.Reason)
+	}
+}
+
 // CLC-v1 §3 wants <vendor>/<product>-v<major>.  An identifier without the
 // version suffix is reported rather than shimmed into looking conformant.
 func TestUnversionedIdentifierIsReported(t *testing.T) {

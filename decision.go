@@ -45,6 +45,11 @@ type AdmissionResult struct {
 	// — declarations outside the intersection (including unrelated schemes) do not participate
 	// in decisions or block connections (P2-A-06/P2-A-07 operation-level mapping).
 	EffectiveCaps []Capability
+	// OperationDecisions records the per-operation CLC verdicts when
+	// cfg.Operations was set.  Populated on the allow path (and kept on the
+	// deny path for the operation that caused it) so upstream can surface
+	// verdict / reason / unresolved to downstream.
+	OperationDecisions []OperationDecision
 }
 
 // AdmissionConfig is the configuration for the admission engine.
@@ -62,7 +67,17 @@ type AdmissionConfig struct {
 	// against the effective authority — the AIC capabilities intersected with
 	// the PrincipalAuthorization grants — so parameter bounds take part in the
 	// decision instead of matching capability ids alone.
+	// Operation decisions are recorded in AdmissionResult.OperationDecisions so
+	// upstream can surface verdict / reason / unresolved to downstream.
 	Operations []Operation
+	// UnresolvedEvaluator is the §8.4 residual-obligation release hook.  When
+	// an operation's CLC decision lands on allow_unresolved (recognized but
+	// not-evaluated constraint, e.g. time:window), the default is fail-closed
+	// deny.  This evaluator can confirm those obligations out-of-band: returning
+	// true releases the operation — the call site must still honor the residual
+	// obligations (semantics.Decision.Unresolved) at runtime.  nil (default)
+	// keeps fail-closed deny.
+	UnresolvedEvaluator func(op Operation, unresolved []string) bool
 	// DisallowRepresentative when set to true rejects DelegationRepresentative mode connections.
 	DisallowRepresentative bool
 	// RequireUserPermission when set to true rejects connections without UserPermission extension.
@@ -503,6 +518,14 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 				Reason:   fmt.Sprintf("operation %s: %v", op.ID, err),
 			}
 		}
+		od := OperationDecision{
+			ID:         op.ID,
+			Params:     op.Params,
+			Verdict:    dec.Verdict,
+			Reason:     dec.Reason,
+			Unresolved: dec.Unresolved,
+		}
+		result.OperationDecisions = append(result.OperationDecisions, od)
 		switch dec.Verdict {
 		case semantics.VerdictAllow:
 			// authorized outright
@@ -514,6 +537,13 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		default:
 			// allow_unresolved is an independent verdict carrying §8.4 residual
 			// obligations; reading it as "allow" would fail open.
+			if cfg.UnresolvedEvaluator != nil && cfg.UnresolvedEvaluator(op, dec.Unresolved) {
+				// The deployment confirmed the residual obligations; the operation
+				// is released but must still be honored at runtime. Only opt-in
+				// paths reach here — nil (default) keeps fail-closed deny.
+				result.OperationDecisions[len(result.OperationDecisions)-1].Released = true
+				continue
+			}
 			return AdmissionResult{
 				Decision: DecisionDeny,
 				Reason:   fmt.Sprintf("operation %s: %s (unresolved %v)", op.ID, dec.Verdict, dec.Unresolved),

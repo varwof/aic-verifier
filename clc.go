@@ -25,6 +25,20 @@ import (
 // parameters the caller wants to use.
 type Operation = semantics.Operation
 
+// OperationDecision records the CLC verdict for one requested operation, so
+// admission results and the AuthContext can expose verdict / reason /
+// unresolved (spec B3) instead of only the final allow/deny.
+type OperationDecision struct {
+	ID         string         `json:"id"`
+	Params     map[string]any `json:"params,omitempty"`
+	Verdict    string         `json:"verdict"` // semantics.VerdictAllow / VerdictDeny / VerdictAllowUR
+	Reason     string         `json:"reason,omitempty"`
+	Unresolved []string       `json:"unresolved,omitempty"`
+	// Released is true when an allow_unresolved operation was admitted because
+	// the deployment's UnresolvedEvaluator confirmed the residual obligations.
+	Released bool `json:"released,omitempty"`
+}
+
 // CLCRevision is the CLC language revision this SDK decides with.
 const CLCRevision = semantics.CLCRevision
 
@@ -119,6 +133,13 @@ func AuthorizeGrants(grants []semantics.Grant, opID string, params map[string]an
 	if err != nil {
 		return semantics.Decision{}, fmt.Errorf("operation %q: %w", opID, err)
 	}
+	// §9.3 pre-check: an absent/empty effective grant set short-circuits to
+	// capability_not_authorized before the operation's layer-1 validation, so
+	// an empty grant with an empty operation is not reported as
+	// missing_capability_id (CLC-1.3 AuthorizeSet).
+	if grantsAbsent(grants) {
+		return semantics.AuthorizeSet(grants, semantics.Operation{ID: opID, Params: normalized}), nil
+	}
 	if err := semantics.ValidateCapabilityID(opID); err != nil {
 		return semantics.Decision{}, fmt.Errorf("operation %q: %w", opID, err)
 	}
@@ -126,6 +147,17 @@ func AuthorizeGrants(grants []semantics.Grant, opID string, params map[string]an
 		return semantics.Decision{}, fmt.Errorf("operation %q: %w", opID, err)
 	}
 	return semantics.AuthorizeSet(grants, semantics.Operation{ID: opID, Params: normalized}), nil
+}
+
+// grantsAbsent reports whether every grant is the zero value (no capability
+// id), which CLC reads as "no effective grant" regardless of the operation.
+func grantsAbsent(grants []semantics.Grant) bool {
+	for _, g := range grants {
+		if g.ID != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // AuthorizeOperation decides a concrete operation for an admitted connection.

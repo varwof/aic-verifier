@@ -6,7 +6,10 @@ package aicverifier
 import (
 	"crypto/x509"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/varwof/register/semantics"
 )
 
 // PipelineCheck is the certificate chain check scope type.
@@ -53,6 +56,10 @@ type PipelineConfig struct {
 	// with the PrincipalAuthorization grants — so parameter bounds take part in
 	// the decision instead of matching capability ids alone.
 	Operations []Operation
+	// UnresolvedEvaluator is the §8.4 residual-obligation release hook for
+	// allow_unresolved CLC decisions; forwarded to AdmissionConfig (see
+	// AdmissionConfig.UnresolvedEvaluator).
+	UnresolvedEvaluator func(op Operation, unresolved []string) bool
 	// DisallowRepresentative disallows delegated representative mode.
 	DisallowRepresentative bool
 	// RequireUserPermission requires user authorization signature.
@@ -147,6 +154,16 @@ type PipelineResult struct {
 	// PrincipalAuthorization is the principal authorization extension carried by the connection
 	// (source of the P∩C intersection).
 	PrincipalAuthorization *PrincipalAuthorization
+	// CLCVerdict / CLCReason / CLCUnresolved aggregate the per-operation CLC
+	// decisions when cfg.Operations was set: "allow" when every requested
+	// operation was authorized outright, "allow_unresolved" when one or more
+	// carried §8.4 residual obligations released by the deployment's
+	// UnresolvedEvaluator.  Empty when no operations were configured.
+	CLCVerdict    string
+	CLCReason     string
+	CLCUnresolved []string
+	// OperationDecisions is the per-operation CLC verdict detail (B3).
+	OperationDecisions []OperationDecision
 }
 
 // OfflineLifetimeLimit is the maximum remaining certificate validity enforced in offline mode (G2(b): ≤1h).
@@ -267,6 +284,7 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		RequiredRuleId:            cfg.RequiredRuleId,
 		RequiredCapabilities:      cfg.RequiredCapabilities,
 		Operations:                cfg.Operations,
+		UnresolvedEvaluator:       cfg.UnresolvedEvaluator,
 		DisallowRepresentative:    cfg.DisallowRepresentative,
 		RequireUserPermission:     cfg.RequireUserPermission,
 		RejectOverflow:            cfg.RejectOverflow,
@@ -453,6 +471,7 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 	}
 
 	serial := clientCert.SerialNumber.Text(16)
+	clcVerdict, clcReason, clcUnresolved := aggregateCLCDecisions(admit.OperationDecisions)
 	return &PipelineResult{
 		Granted:                true,
 		Roles:                  roles,
@@ -462,7 +481,37 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		SPIFFEID:               spiffeID,
 		AIC:                    admit.AIC,
 		PrincipalAuthorization: admit.PrincipalAuthorization,
+		CLCVerdict:             clcVerdict,
+		CLCReason:              clcReason,
+		CLCUnresolved:          clcUnresolved,
+		OperationDecisions:     admit.OperationDecisions,
 	}
+}
+
+// aggregateCLCDecisions rolls per-operation CLC verdicts into the single
+// verdict surfaced on the admission result.  An empty operation list produces
+// an empty verdict so "no operations configured" stays distinguishable from
+// "all operations allowed".  A released allow_unresolved operation keeps the
+// allow_unresolved verdict — the connection is admitted but the residual
+// obligations must still be honored at runtime (B3).
+func aggregateCLCDecisions(ops []OperationDecision) (verdict, reason string, unresolved []string) {
+	if len(ops) == 0 {
+		return "", "", nil
+	}
+	verdict = semantics.VerdictAllow
+	var reasons []string
+	for _, od := range ops {
+		if od.Verdict != semantics.VerdictAllowUR {
+			continue
+		}
+		verdict = semantics.VerdictAllowUR
+		if od.Reason != "" {
+			reasons = append(reasons, od.Reason)
+		}
+		unresolved = append(unresolved, od.Unresolved...)
+	}
+	reason = strings.Join(reasons, "; ")
+	return verdict, reason, unresolved
 }
 
 func checkCertValidity(cert *x509.Certificate) error {
