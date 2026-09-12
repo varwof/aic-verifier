@@ -47,6 +47,12 @@ type PipelineConfig struct {
 	RequiredRuleId string
 	// RequiredCapabilities is the list of capabilities the client must possess.
 	RequiredCapabilities []string
+	// Operations are the concrete actions (capability id + parameters) this
+	// request wants to perform.  When set, each one is decided with the CLC
+	// core against the effective authority — the AIC capabilities intersected
+	// with the PrincipalAuthorization grants — so parameter bounds take part in
+	// the decision instead of matching capability ids alone.
+	Operations []Operation
 	// DisallowRepresentative disallows delegated representative mode.
 	DisallowRepresentative bool
 	// RequireUserPermission requires user authorization signature.
@@ -260,6 +266,7 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		RequiredProtocol:          cfg.RequiredProtocol,
 		RequiredRuleId:            cfg.RequiredRuleId,
 		RequiredCapabilities:      cfg.RequiredCapabilities,
+		Operations:                cfg.Operations,
 		DisallowRepresentative:    cfg.DisallowRepresentative,
 		RequireUserPermission:     cfg.RequireUserPermission,
 		RejectOverflow:            cfg.RejectOverflow,

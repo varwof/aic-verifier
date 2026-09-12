@@ -5,6 +5,7 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -20,6 +21,8 @@ func main() {
 	certFile := flag.String("cert", "", "server certificate (leaf or chain)")
 	keyFile := flag.String("key", "", "server key")
 	capability := flag.String("cap", "", "required capability id")
+	opID := flag.String("op", "", "concrete operation to authorize (CLC); empty skips")
+	opParams := flag.String("op-params", "", "operation parameters as JSON")
 	requireAIC := flag.Bool("require-aic", true, "require the AIC extension (false also admits a human certificate whose PrincipalAuthorization covers the capability)")
 	flag.Parse()
 	if *caFile == "" || *certFile == "" || *keyFile == "" {
@@ -36,6 +39,15 @@ func main() {
 	}
 	if *capability == "" {
 		conf.RequiredCapabilities = nil
+	}
+	if *opID != "" {
+		op := aicverifier.Operation{ID: *opID}
+		if *opParams != "" {
+			if err := json.Unmarshal([]byte(*opParams), &op.Params); err != nil {
+				log.Fatalf("--op-params: %v", err)
+			}
+		}
+		conf.RequiredOperations = []aicverifier.Operation{op}
 	}
 
 	mux := http.NewServeMux()

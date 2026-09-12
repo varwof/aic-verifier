@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"fmt"
+	"github.com/varwof/register/semantics"
 	"log/slog"
 	"net/http"
 	"time"
@@ -56,6 +57,12 @@ type AdmissionConfig struct {
 	RequiredRuleId string
 	// RequiredCapabilities requires the Agent to have all specified CapabilityIds (empty = no check).
 	RequiredCapabilities []string
+	// Operations are the concrete actions (capability id + parameters) this
+	// request wants to perform.  When set, each is decided with the CLC core
+	// against the effective authority — the AIC capabilities intersected with
+	// the PrincipalAuthorization grants — so parameter bounds take part in the
+	// decision instead of matching capability ids alone.
+	Operations []Operation
 	// DisallowRepresentative when set to true rejects DelegationRepresentative mode connections.
 	DisallowRepresentative bool
 	// RequireUserPermission when set to true rejects connections without UserPermission extension.
@@ -480,6 +487,36 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 			return AdmissionResult{
 				Decision: DecisionDeny,
 				Reason:   fmt.Sprintf("missing capabilities: %v", missing),
+			}
+		}
+	}
+
+	// Concrete-operation authorization (CLC).  The id-only check above cannot
+	// see parameters, so a grant of {"tables":["a"]} and a request for
+	// {"tables":["a","b"]} look identical to it.  Each declared operation is
+	// decided by the CLC core instead, over the effective authority.
+	for _, op := range cfg.Operations {
+		dec, err := AuthorizeOperation(aic, result.PrincipalAuthorization, op.ID, op.Params)
+		if err != nil {
+			return AdmissionResult{
+				Decision: DecisionDeny,
+				Reason:   fmt.Sprintf("operation %s: %v", op.ID, err),
+			}
+		}
+		switch dec.Verdict {
+		case semantics.VerdictAllow:
+			// authorized outright
+		case semantics.VerdictDeny:
+			return AdmissionResult{
+				Decision: DecisionDeny,
+				Reason:   fmt.Sprintf("operation %s denied: %s", op.ID, dec.Reason),
+			}
+		default:
+			// allow_unresolved is an independent verdict carrying §8.4 residual
+			// obligations; reading it as "allow" would fail open.
+			return AdmissionResult{
+				Decision: DecisionDeny,
+				Reason:   fmt.Sprintf("operation %s: %s (unresolved %v)", op.ID, dec.Verdict, dec.Unresolved),
 			}
 		}
 	}

@@ -21,6 +21,10 @@ import (
 	"github.com/varwof/register/semantics"
 )
 
+// Operation is a concrete action to authorize: a capability id plus the
+// parameters the caller wants to use.
+type Operation = semantics.Operation
+
 // CLCRevision is the CLC language revision this SDK decides with.
 const CLCRevision = semantics.CLCRevision
 
@@ -58,11 +62,55 @@ func ToGrantSet(caps []Capability) ([]semantics.Grant, error) {
 // AuthorizeCapabilities decides a concrete operation against an explicit
 // capability list.
 func AuthorizeCapabilities(caps []Capability, opID string, params map[string]any) (semantics.Decision, error) {
+	return AuthorizeCapabilitiesWithConstraints(caps, nil, opID, params)
+}
+
+// AuthorizeCapabilitiesWithConstraints decides an operation against a
+// capability list whose grants also carry the connection's authorization
+// constraints.
+//
+// Constraints are what make the three-valued verdict interesting: the CLC core
+// evaluates a few of them itself (max_rows), recognises the rest (time:window,
+// network:cidr) and reports them as residual obligations rather than silently
+// dropping them — so a caller that reads only "allow" fails closed.
+func AuthorizeCapabilitiesWithConstraints(caps, constraints []Capability, opID string, params map[string]any) (semantics.Decision, error) {
 	grants, err := ToGrantSet(caps)
 	if err != nil {
 		return semantics.Decision{}, err
 	}
+	if cs := ConstraintStrings(constraints); len(cs) > 0 {
+		for i := range grants {
+			grants[i].Constraints = append(grants[i].Constraints, cs...)
+		}
+	}
 	return AuthorizeGrants(grants, opID, params)
+}
+
+// ConstraintStrings renders authorization constraints in CLC form:
+// <scheme>:<type>[:<params-json>], e.g.
+// varwof/constraint-v1:network:cidr:["192.0.2.0/24"].
+func ConstraintStrings(constraints []Capability) []string {
+	out := make([]string, 0, len(constraints))
+	for _, c := range constraints {
+		// The AIC extension carries constraints under the bare scheme
+		// "constraint" / "constraint-v1"; the CLC core names that namespace
+		// varwof/constraint-v1.  Normalise so the language recognises them
+		// instead of reporting an unknown constraint.
+		scheme := c.SchemeId
+		switch scheme {
+		case "constraint", "constraint-v1":
+			scheme = "varwof/constraint-v1"
+		}
+		s := scheme
+		if c.CapabilityId != "" {
+			s += ":" + c.CapabilityId
+		}
+		if len(c.Parameters) > 0 {
+			s += ":" + string(c.Parameters)
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // AuthorizeGrants decides opID/params against an explicit CLC-v1 grant set.
@@ -93,7 +141,7 @@ func AuthorizeOperation(aic *AIC, pa *PrincipalAuthorization, opID string, param
 	if aic == nil {
 		return AuthorizeCapabilities(pa.Grants, opID, params)
 	}
-	aisDec, err := AuthorizeCapabilities(aic.Capabilities, opID, params)
+	aisDec, err := AuthorizeCapabilitiesWithConstraints(aic.Capabilities, aic.AuthorizationConstraints, opID, params)
 	if err != nil {
 		return semantics.Decision{}, err
 	}

@@ -96,6 +96,11 @@ type Config struct {
 	RequireAIC bool
 	// RequiredCapabilities requires the agent to hold all listed CapabilityIds.
 	RequiredCapabilities []string
+	// RequiredOperations are the concrete actions (id + parameters) this
+	// service authorizes.  Unlike RequiredCapabilities, parameter bounds are
+	// part of the decision (CLC): an operation asking for more than the grant
+	// allows is denied.
+	RequiredOperations []Operation
 	// DisallowRepresentative rejects DelegationRepresentative-mode AIC.
 	DisallowRepresentative bool
 	// RequireUserAuth requires DelegationAuthorization signature verification.
@@ -432,6 +437,7 @@ func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
 		CheckScope:               CheckFullChain,
 		RequireAIC:               a.cfg.RequireAIC,
 		RequiredCapabilities:     a.cfg.RequiredCapabilities,
+		Operations:               a.cfg.RequiredOperations,
 		DisallowRepresentative:   a.cfg.DisallowRepresentative,
 		RequireUserAuth:          a.cfg.RequireUserAuth,
 		ClientIP:                 clientIPOf(r),
