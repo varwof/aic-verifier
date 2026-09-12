@@ -139,6 +139,28 @@ func readAudit(t *testing.T, path, needle string) []map[string]any {
 	return nil
 }
 
+// waitAudit polls the audit file until want is satisfied (or the deadline
+// expires).  AuditLogger.Log is asynchronous — entries are queued on a channel
+// and flushed by a background loop — so a test that needs a *set* of entries
+// (e.g. one allow and one deny) must not stop at the first matching line.
+func waitAudit(t *testing.T, path string, want func([]map[string]any) bool) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var lines []map[string]any
+	for {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			lines = parseAuditLines(t, data)
+			if want(lines) {
+				return lines
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("audit condition not met; entries: %v", lines)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func parseAuditLines(t *testing.T, data []byte) []map[string]any {
 	t.Helper()
 	var out []map[string]any
@@ -454,7 +476,19 @@ func TestTrustProxyIdentityFromHeaders(t *testing.T) {
 	}
 
 	// audit: allow + deny entries present, deny carries the header-supplied agent.
-	lines := readAudit(t, path, `"action":"mcp_tools_call"`)
+	// Log is async, so poll until *both* entries are on disk before asserting.
+	lines := waitAudit(t, path, func(ls []map[string]any) bool {
+		var sawAllow, sawDenAgent bool
+		for _, e2 := range ls {
+			if e2["decision"] == "allow" && e2["agent_id"] == "agent-001" {
+				sawAllow = true
+			}
+			if e2["decision"] == "deny" && e2["agent_id"] == "agent-002" {
+				sawDenAgent = true
+			}
+		}
+		return sawAllow && sawDenAgent
+	})
 	var sawAllow, sawDenAgent bool
 	for _, e2 := range lines {
 		if e2["decision"] == "allow" && e2["agent_id"] == "agent-001" {
