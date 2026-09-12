@@ -4,7 +4,7 @@
 // Command bearer-jwt-backend demonstrates the aic-verifier SDK protecting a real
 // HTTP API:
 //
-//	$ go run ./gen-bearer            # creates ca.pem + prints a Bearer token
+//	$ go run ./gen-bearer            # creates ca.pem + the server TLS pair, prints a Bearer token
 //	$ go run . --addr :9443          # AIC-protected reverse proxy on :9443
 //	$ curl -k https://localhost:9443/api --header "Authorization: Bearer $TOKEN"
 //

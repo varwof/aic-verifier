@@ -27,10 +27,18 @@ import (
 const (
 	caCert = "ca.pem"
 	caKey  = "ca-key.pem"
+
+	tlsCert = "server-cert.pem"
+	tlsKey  = "server-key.pem"
 )
 
 func main() {
 	if err := ensureCA(); err != nil {
+		fmt.Fprintln(os.Stderr, "gen-bearer:", err)
+		os.Exit(1)
+	}
+
+	if err := ensureTLSPair(); err != nil {
 		fmt.Fprintln(os.Stderr, "gen-bearer:", err)
 		os.Exit(1)
 	}
@@ -86,6 +94,43 @@ func ensureCA() error {
 		return err
 	}
 	return writePEM(caKey, "EC PRIVATE KEY", keyDER)
+}
+
+// ensureTLSPair writes server-cert.pem + server-key.pem when missing.  The
+// example proxy terminates TLS with this self-signed localhost pair; generating
+// it here keeps private key material out of the repository.
+func ensureTLSPair() error {
+	if _, err := os.Stat(tlsCert); err == nil {
+		if _, err := os.Stat(tlsKey); err == nil {
+			return nil
+		}
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate TLS key: %w", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		DNSNames:              []string{"localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * 365 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return fmt.Errorf("create TLS cert: %w", err)
+	}
+	if err := writePEM(tlsCert, "CERTIFICATE", der); err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+	return writePEM(tlsKey, "EC PRIVATE KEY", keyDER)
 }
 
 func readCAPair(certFile, keyFile string) (*caPair, error) {

@@ -10,3 +10,6 @@
 *.swo
 .DS_Store
 Thumbs.db
+
+# Generated example key material (created by the examples)
+examples/bearer-jwt-backend/*.pem
