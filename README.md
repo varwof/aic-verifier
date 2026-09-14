@@ -49,12 +49,13 @@ curl -sS --cert demo-certs/client-cert.pem --key demo-certs/client-key.pem \
 # {"backend":"real-api-mtls","identity":{...}}
 ```
 
-Drop the client certificate (or ask for a capability the agent does not hold) and
-the same call is refused before it reaches the backend:
+Ask for something the agent is not allowed to do and the call is refused before
+it reaches the backend:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' --cacert demo-certs/ca-cert.pem https://localhost:9444/api
-# 403
+curl -sS --cert demo-certs/client-cert.pem --key demo-certs/client-key.pem \
+     --cacert demo-certs/ca-cert.pem https://localhost:9444/api/transfer
+# {"code":"access_denied","message":"agent missing required capabilities"}
 ```
 
 Step-by-step, including how to see the decision record and the refusal challenge:

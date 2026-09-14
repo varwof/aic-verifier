@@ -48,15 +48,17 @@ the demo CA **and** held the capability the route requires.
 
 ## 4. Watch it be refused
 
-Without a client certificate there is no verified agent:
+Without a client certificate there is no agent to verify, and mTLS refuses the
+connection before HTTP exists:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' --cacert demo-certs/ca-cert.pem https://127.0.0.1:9444/api
-# 403
+curl -sS --cacert demo-certs/ca-cert.pem https://127.0.0.1:9444/api
+# curl: (56) ... tlsv13 alert certificate required
 ```
 
-And a capability the agent does not hold is refused before the backend sees
-anything (the `/api/transfer` route requires a different capability):
+A certificate that verifies but does not hold the capability the route requires
+gets an HTTP refusal before the backend sees anything (the `/api/transfer` route
+requires a different capability):
 
 ```bash
 curl -sS --cert demo-certs/client-cert.pem --key demo-certs/client-key.pem \
