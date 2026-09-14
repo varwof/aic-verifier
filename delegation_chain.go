@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Jijie Wei (varwof)
 // SPDX-License-Identifier: Apache-2.0
 
-// Delegation chain hardening — specification P1-B-14/15/16/17
+// Delegation chain hardening
 //
-//   - Anti-cycle (P1-B-14): certificate serial number deduplication within chain, reject on duplicate (cycle/reuse detection);
-//   - Anti-certificate-bomb (P1-B-15): reject when chain length exceeds MaxChainLength;
-//   - Per-level capability subset (P1-B-16): each level's AIC.capabilities must be a subset of the parent's effective capabilities (permissions only decrease);
-//   - Recursive intersection along chain (P1-B-17): C_eff = P ∩ C_1 ∩ … ∩ C_n, computed level by level; any failure rejects the entire chain.
+//   - Anti-cycle: certificate serial number deduplication within chain, reject on duplicate (cycle/reuse detection);
+//   - Anti-certificate-bomb: reject when chain length exceeds MaxChainLength;
+//   - Per-level capability subset: each level's AIC.capabilities must be a subset of the parent's effective capabilities (permissions only decrease);
+//   - Recursive intersection along chain: C_eff = P ∩ C_1 ∩ … ∩ C_n, computed level by level; any failure rejects the entire chain.
 
 package aicverifier
 
@@ -19,7 +19,7 @@ import (
 )
 
 // DefaultMaxChainLength is the default upper bound for maximum delegation chain length
-// (anti-certificate-bomb, P1-B-15). Chains exceeding this are rejected (specification
+// (anti-certificate-bomb). Chains exceeding this are rejected (specification
 // maxDepth is set by the top Principal; this serves as the gateway-side hard limit).
 // Real-world Agent delegation depths are typically 2–3 levels; default 8 provides ample margin.
 const DefaultMaxChainLength = 8
@@ -31,7 +31,7 @@ func capabilityID(c pki.Capability) string {
 }
 
 // capabilityCovered reports whether leaf capability is covered by ancestor capability.
-// Coverage relationship (specification P1-B-16/17 capability subset semantics):
+// Coverage relationship (capability subset semantics):
 //   - Exact equality, or ancestor is a wildcard (glob, MatchCapability semantics, e.g. database:*);
 //   - Or ancestor is a specific path prefix of leaf (permission narrowing: database:query covers
 //     database:query:SELECT).
@@ -51,7 +51,7 @@ func capabilityCovered(leaf, ancestor pki.Capability) bool {
 }
 
 // capabilitySubset reports whether every capability in subset is covered by
-// some capability in superset (this level ⊆ parent effective capabilities, P1-B-16).
+// some capability in superset (this level ⊆ parent effective capabilities).
 func capabilitySubset(subset, superset []pki.Capability) bool {
 	if len(subset) == 0 {
 		return true
@@ -91,7 +91,7 @@ func filterCovered(leaf, ancestor []pki.Capability) []pki.Capability {
 	return out
 }
 
-// verifyChainStructure validates chain structure constraints (P1-B-14/15):
+// verifyChainStructure validates chain structure constraints:
 //   - Non-empty, does not exceed MaxChainLength (anti-certificate-bomb);
 //   - No duplicate certificate serial numbers within the chain (anti-cycle).
 func verifyChainStructure(chain []*x509.Certificate, maxChainLen int) error {
@@ -116,7 +116,7 @@ func verifyChainStructure(chain []*x509.Certificate, maxChainLen int) error {
 }
 
 // EffectiveDelegationCapabilities validates per-level capability subsets and computes
-// the intersection along the delegation chain (P1-B-16/17).
+// the intersection along the delegation chain.
 //
 // chain goes top-down: chain[0]=topmost delegated Agent, chain[len-1]=bottom Agent.
 // principalCaps is the effective capabilities P of the original principal (top Principal).

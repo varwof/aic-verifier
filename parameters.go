@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Jijie Wei (varwof)
 // SPDX-License-Identifier: Apache-2.0
 
-// Parameter-level boundary validation — patent spec P1-B-11 / P2-B-05
+// Parameter-level boundary validation
 //
 // Each schemeId defines its own parameter boundary comparison logic (e.g., max_rows).
 // Scenario: principal grants max_rows=1000, agent declares 100 → pass (takes 100);
@@ -9,7 +9,7 @@
 //
 // The gateway runtime only performs capability-level intersection (no per-parameter
 // comparison); parameter-level boundaries are checked by registered validators at
-// CA signing time (P2-B-05) or when explicitly enabled (P1-B-11).
+// CA signing time, or when explicitly enabled.
 
 package aicverifier
 
@@ -152,7 +152,7 @@ func parseMaxRows(raw []byte) (int64, bool, error) {
 	return *p.MaxRows, true, nil
 }
 
-// maxRowsValidator is an example parameter boundary validator (patent spec P1-B-11/P2-B-05 example semantics).
+// maxRowsValidator is an example parameter boundary validator.
 // schemeId is "report"; declared max_rows must not exceed the authorized boundary.
 type maxRowsValidator struct{}
 

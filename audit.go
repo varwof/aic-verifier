@@ -73,7 +73,7 @@ type AuditEntry struct {
 	Decision       string   `json:"decision,omitempty"`
 	Capabilities   []string `json:"capabilities,omitempty"`
 	// Level is the audit entry level (INFO/WARN/ERROR). Plugin decisions: allow=INFO,
-	// deny/execution error=WARN (spec P2-A-28).
+	// deny/execution error=WARN.
 	Level string `json:"level,omitempty"`
 	// DaHash is the SHA-256 hex hash of the DelegationAuthorization signatureValue
 	// (authorization evidence fingerprint, Task 4: binding authorization evidence to action records).
@@ -768,7 +768,7 @@ type PluginAuditEntry struct {
 	Reason       string `json:"reason"`
 	ClientCN     string `json:"client_cn,omitempty"`
 	Principal    string `json:"principal,omitempty"`
-	// Level is the audit level (INFO/WARN). Allow→INFO, deny/execution error→WARN (spec P2-A-28).
+	// Level is the audit level (INFO/WARN). Allow→INFO, deny/execution error→WARN.
 	// Empty value defaults to INFO.
 	Level string `json:"level,omitempty"`
 	// DaHash is the SHA-256 hash of the DelegationAuthorization signatureValue
@@ -779,7 +779,7 @@ type PluginAuditEntry struct {
 }
 
 // LogPluginDecision writes a plugin decision event to the audit log.
-// Deny and execution errors are logged as WARN, allow as INFO (spec P2-A-28).
+// Deny and execution errors are logged as WARN, allow as INFO.
 // When entry.Level is empty, it is inferred from Decision ("allow"→INFO, others→WARN).
 func LogPluginDecision(logger *AuditLogger, entry PluginAuditEntry) {
 	if logger == nil {

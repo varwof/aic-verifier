@@ -110,17 +110,16 @@ type PipelineConfig struct {
 	UserCertResolver func(keyHash []byte) (*x509.Certificate, error)
 	// EnforceConstraints, when true, enforces authorizationConstraints.
 	EnforceConstraints bool
-	// StrictConstraints, when true, fails-closed on unknown constraint types (patent spec P1-B-23).
+	// StrictConstraints, when true, fails-closed on unknown constraint types.
 	StrictConstraints bool
-	// ParameterValidators is the parameter boundary validator registry
-	// (patent spec P1-B-11/P2-B-05).
+	// ParameterValidators is the parameter boundary validator registry.
 	// When non-nil, after the P∩C intersection, parameters of AIC declarations and PA
 	// authorizations are compared one by one against the boundary; out-of-bounds → reject.
 	ParameterValidators *ParameterValidatorRegistry
-	// PolicyServer is the Layer 3 online authorization policy server (patent spec P2-A-02).
+	// PolicyServer is the Layer 3 online authorization policy server.
 	// Called by VerifyLayer3/VerifyTrustLayers; not used by RunAccessPipeline.
 	PolicyServer PolicyServer
-	// CredentialBundle is the client-submitted credential bundle (P1-B-27/P1-B-29/P2-A-01).
+	// CredentialBundle is the client-submitted credential bundle (agent, principal and CA chains).
 	// When RequireUserAuth is enabled, the Principal certificate is preferentially extracted
 	// from the credential bundle for DA signature verification.
 	CredentialBundle *CredentialBundle
@@ -328,7 +327,7 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		return res
 	}
 
-	// Parameter-level boundary validation (P1-B-11/P2-B-05): AIC-declared parameters must not
+	// Parameter-level boundary validation: AIC-declared parameters must not
 	// exceed PA authorization boundaries.
 	// After the P∩C intersection (inside CheckAdmission), parameters are compared one by one;
 	// the iteration target is EffectiveCaps (intersection); declarations outside the intersection
@@ -359,7 +358,7 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 	}
 
 	// Phase one (connection/declaration layer): P∩C intersection + scheme-aligned plugin
-	// evaluation (P2-A-06/P2-A-07).
+	// evaluation.
 	// Plugin decisions are only made for schemes this gateway declares to serve: plugin deny →
 	// reject connection; plugin allow → allow.
 	// Schemes not served by this gateway (no plugin) → ignore, do not block connection
@@ -584,7 +583,7 @@ func aicAgentID(cert *x509.Certificate) string {
 	return cert.Subject.CommonName
 }
 
-// CheckOperationCapability executes phase two (operation layer) plugin decisions (P2-A-06/P2-A-07).
+// CheckOperationCapability executes phase two (operation layer) plugin decisions.
 // Called by the gateway before processing a specific operation (e.g., HTTP route, TCP tunnel,
 // UDP target), making decisions only for the capability corresponding to that operation:
 //

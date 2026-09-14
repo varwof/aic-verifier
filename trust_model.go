@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Jijie Wei (varwof)
 // SPDX-License-Identifier: Apache-2.0
 
-// Three-layer trust model — spec P2-A-02
+// Three-layer trust model
 //
 //	Layer 1 Identity verification (Agent Cert + CA Chain)
 //	Layer 2 Representation verification (+ Principal Cert + PA)
@@ -64,7 +64,7 @@ type Layer3Result struct {
 	Reason   string
 }
 
-// PolicyServer is the Layer 3 online authorization policy server interface (spec P2-A-02 Layer 3).
+// PolicyServer is the Layer 3 online authorization policy server interface (Layer 3).
 // Online authorization verification includes revocation freshness (OCSP/CRL, handled by
 // PipelineConfig's cache instances) and policy server policy checks (if configured).
 type PolicyServer interface {

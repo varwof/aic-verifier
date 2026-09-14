@@ -43,7 +43,7 @@ type AdmissionResult struct {
 	// preserving full Capability (including SchemeId/Parameters). When no PA is present,
 	// equals the full AIC declarations. Phase two plugin evaluation only acts on this set
 	// — declarations outside the intersection (including unrelated schemes) do not participate
-	// in decisions or block connections (P2-A-06/P2-A-07 operation-level mapping).
+	// in decisions or block connections (operation-level mapping).
 	EffectiveCaps []Capability
 	// OperationDecisions records the per-operation CLC verdicts when
 	// cfg.Operations was set.  Populated on the allow path (and kept on the
@@ -131,7 +131,7 @@ type AdmissionConfig struct {
 	// StrictConstraints when set to true directly rejects connections with unregistered constraint types
 	// in authorizationConstraints (unknown capabilityId under constraint/constraint-v1 scheme),
 	// fail-closed. Default false only logs audit warnings for unknown constraints and ignores them
-	// (forward compatible, specification P1-B-23 strict mode).
+	// (forward compatible, strict mode).
 	StrictConstraints bool
 	// ClientIP is used for authorizationConstraints allowed-cidr checks.
 	ClientIP string
@@ -141,12 +141,12 @@ type AdmissionConfig struct {
 	// CheckDAAge when set to true validates DelegationAuthorization.timestamp freshness
 	// (|now - timestamp| ≤ DAAgeMax). Default off — specification delegates lifecycle validation
 	// to X.509 NotAfter (dev-docs/aic/06-delegation-auth.md §validation flow (gateway runtime));
-	// deployments requiring stricter time window defense (specification P1-B-13) can enable this.
+	// deployments requiring stricter time window defense can enable this.
 	CheckDAAge bool
 	// DAAgeMax is the DA timestamp freshness window (|now - timestamp| ≤ DAAgeMax).
 	// Only effective when CheckDAAge=true; <=0 uses DefaultDAAgeMax (30 seconds).
 	DAAgeMax time.Duration
-	// CredentialBundle is the client-submitted credential bundle (P1-B-27/P1-B-29/P2-A-01).
+	// CredentialBundle is the client-submitted credential bundle (agent, principal and CA chains).
 	// When RequireUserAuth is true and UserCert is nil, prioritizes the Principal certificate
 	// from the credential bundle for DA signature verification (including keyHash cross-validation);
 	// falls back to UserCertResolver when missing.
@@ -154,7 +154,7 @@ type AdmissionConfig struct {
 }
 
 // DefaultDAAgeMax is the default value for the DelegationAuthorization.timestamp freshness window
-// (specification P1-B-13 / dev-docs/aic/06-delegation-auth.md §validation flow ①: |now - timestamp| ≤ 30s).
+// (the delegation-authorization validation flow: |now - timestamp| ≤ 30s).
 const DefaultDAAgeMax = 30 * time.Second
 
 // CheckDAFreshness validates that DelegationAuthorization.timestamp is within the freshness window.
@@ -434,7 +434,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		return AdmissionResult{Decision: DecisionDeny, Reason: fmt.Sprintf("principal_authorization parse: %v", parseErr)}
 	}
 	result.PrincipalAuthorization = pa
-	// Runtime principal PA refresh (patent: P_grants uses the latest
+	// Runtime principal PA refresh (the effective grants use the latest
 	// principal certificate). When a current principal certificate is
 	// available (UserCert or credential bundle) and its keyHash matches
 	// the AIC's principalUid, its PrincipalAuthorization becomes the
@@ -457,7 +457,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		if err := CheckAuthorizationConstraints(result.PrincipalAuthorization.AuthorizationConstraints, cfg.ClientIP); err != nil {
 			return AdmissionResult{Decision: DecisionDeny, Reason: fmt.Sprintf("pa constraint: %v", err)}
 		}
-		// Strict mode: unknown PA constraint type fail-closed (specification P1-B-23).
+		// Strict mode: unknown PA constraint type fail-closed.
 		if cfg.StrictConstraints {
 			if u := firstUnknownConstraint(result.PrincipalAuthorization.AuthorizationConstraints); u != nil {
 				return AdmissionResult{
@@ -470,7 +470,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 
 	// v1.6: authorizationConstraints execute first (low-cost fast rejection)
 	if aic != nil && cfg.EnforceConstraints && len(aic.AuthorizationConstraints) > 0 {
-		// Strict mode priority: unknown constraint type fail-closed (specification P1-B-23).
+		// Strict mode priority: unknown constraint type fail-closed.
 		if cfg.StrictConstraints {
 			if u := firstUnknownConstraint(aic.AuthorizationConstraints); u != nil {
 				return AdmissionResult{
@@ -641,7 +641,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 			return AdmissionResult{Decision: DecisionDeny, Reason: "user_auth: signature required but empty"}
 		}
 		userCert := cfg.UserCert
-		// P1-B-27/P1-B-29: credential bundle takes priority — principal certificate is submitted
+		// Credential bundle takes priority — principal certificate is submitted
 		// together with the credential bundle; dual-chain verification includes keyHash cross-validation.
 		// Falls back to UserCertResolver (fetches by keyHash from local store) when missing.
 		if userCert == nil && cfg.CredentialBundle != nil {
@@ -702,7 +702,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 				Reason:   fmt.Sprintf("user_auth: %v", err),
 			}
 		}
-		// Optional time window defense (P1-B-13): validate DA.timestamp freshness. Default off,
+		// Optional time window defense: validate DA.timestamp freshness. Default off,
 		// lifecycle validation is handled by X.509 NotAfter; when enabled, additionally requires
 		// |now - timestamp| ≤ DAAgeMax (the "short time window second defense" in the specification).
 		if cfg.CheckDAAge {
@@ -729,7 +729,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		}
 	}
 
-	// v1.5: AIC and PrincipalAuthorization capability intersection (P1-B-07/P2-A-04/P1-17):
+	// v1.5: AIC and PrincipalAuthorization capability intersection:
 	//   - Representative mode (DelegationMode=1): P_effective = P_grants ∩ C_agent,
 	//     validates capabilities ⊆ principal permissions, performs intersection + overflow rejection;
 	//   - Authorized mode (DelegationMode=0/default): uses AIC.capabilities directly as the permission basis,
@@ -764,7 +764,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 			result.EffectiveCaps = nil
 		}
 	} else if aic != nil {
-		// Authorized mode (or no PA): effective caps = full AIC declarations (P2-A-04, no upper-bound check).
+		// Authorized mode (or no PA): effective caps = full AIC declarations (no upper-bound check).
 		result.EffectiveCaps = append([]Capability(nil), aic.Capabilities...)
 	} else if result.PrincipalAuthorization != nil {
 		// Direct authorization (no AIC human cert): effective caps = full PA grants.
@@ -778,7 +778,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 // effectiveCapabilities computes the full capability intersection (P∩C) between AIC
 // declared capabilities and PA grants. Unlike IntersectPermissions which returns only
 // CapabilityId strings, this preserves the full structure (SchemeId/Parameters) for each
-// matched declaration, used by stage-2 plugin evaluation to align by scheme (P2-A-06: unrelated schemes ignored).
+// matched declaration, used by stage-2 plugin evaluation to align by scheme (unrelated schemes ignored).
 func effectiveCapabilities(declared []Capability, grants []string) []Capability {
 	var out []Capability
 	for _, c := range declared {
@@ -881,7 +881,7 @@ func VerifyDelegationAuth(aic *AIC, userCert *x509.Certificate) error {
 type DelegationChainVerifier struct {
 	// MaxDepth is the maximum delegation depth allowed by the top Principal (including intermediate Agent B etc.).
 	MaxDepth int
-	// MaxChainLength is the hard upper limit to prevent certificate bomb attacks (P1-B-15):
+	// MaxChainLength is the hard upper limit to prevent certificate bomb attacks:
 	// ≤0 means no extra limit (only constrained by MaxDepth).
 	MaxChainLength int
 }
@@ -909,7 +909,7 @@ func (v *DelegationChainVerifier) Verify(chain []*x509.Certificate, topPrincipal
 	if len(chain) > v.MaxDepth {
 		return fmt.Errorf("delegation_chain: chain depth %d exceeds maxDepth %d", len(chain), v.MaxDepth)
 	}
-	// Anti-loop + anti-certificate-bomb (P1-B-14/15).
+	// Anti-loop + anti-certificate-bomb.
 	if err := verifyChainStructure(chain, v.MaxChainLength); err != nil {
 		return err
 	}

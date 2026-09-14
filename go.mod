@@ -19,6 +19,6 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 )
 
-// 临时：本地开发期使用兄弟目录的 register（含 DecisionRecord 与义务判定 API）。
-// 发布前必须改成版本化 require（见 dev-docs/aic/zh/16-next-work-prompt.md A1/A3）。
+// Temporary: development builds use the sibling register tree, which carries the
+// DecisionRecord and obligation APIs.  Replace with a versioned require before release.
 replace github.com/varwof/register => ../register

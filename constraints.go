@@ -238,11 +238,11 @@ func parseCIDRParam(raw []byte) ([]string, error) {
 }
 
 // MaxConcurrentMin is the minimum value for the max parameter of the max-concurrent
-// constraint (patent P1-A-29).
+// constraint.
 const MaxConcurrentMin = 1
 
 // MaxConcurrentMax is the maximum value for the max parameter of the max-concurrent
-// constraint (patent P1-A-29).
+// constraint.
 const MaxConcurrentMax = 1024
 
 // parseMaxConcurrentParam parses the max-concurrent parameters (JSON {"max": N})

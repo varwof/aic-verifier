@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Jijie Wei (varwof)
 // SPDX-License-Identifier: Apache-2.0
 
-// Credential Bundle — Patent P1-B-27 / P1-B-29 / P2-A-01
+// Credential Bundle — the client-submitted agent, principal and CA chain bundle
 //
 // A credential bundle consists of three parts:
 //   - Agent Certificate (contains AIC, agent chain first);
@@ -71,7 +71,7 @@ func (b *CredentialBundle) Principal() *x509.Certificate {
 	return b.PrincipalChain[0]
 }
 
-// VerifyBundle verifies the credential bundle dual chain (P1-B-29):
+// VerifyBundle verifies the credential bundle dual chain:
 //   - Agent chain → trust root (default client authentication EKU);
 //   - Principal chain → same trust root;
 //   - keyHash match: AIC.PrincipalUid.KeyHash == SHA256(Principal SPKI).
@@ -155,7 +155,7 @@ func intermediatesPool(certs []*x509.Certificate) *x509.CertPool {
 }
 
 // ParseCredentialBundlePEM parses a credential bundle from PEM data
-// (P2-A-01 order: Agent chain first, Principal second, CA chain last).
+// (order: agent chain first, principal second, CA chain last).
 // Certificates are classified by extensions: AIC-containing → Agent chain,
 // PA-containing → Principal chain, rest → CA. The parsed result must be
 // verified via VerifyBundle before use.
