@@ -112,8 +112,10 @@ func makeClient(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) *x509
 			KeyHash: make([]byte, 32),
 		},
 		Capabilities: []pki.Capability{
-			{SchemeId: "demo", CapabilityId: "api:read"},
-			{SchemeId: "demo", CapabilityId: "demo:http:*"},
+			// SchemeId must be the CLC scheme form (vendor/product-vN); the
+			// full capability id is scheme + ":" + CapabilityId.
+			{SchemeId: "demo/example-v1", CapabilityId: "api:read"},
+			{SchemeId: "demo/example-v1", CapabilityId: "http:*"},
 		},
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:             pki.Reason{ReasonCode: "TEST", Description: "mtls example"},
