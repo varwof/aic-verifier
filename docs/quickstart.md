@@ -119,14 +119,24 @@ ls records/
 # smoke-verify-9f13afb2...json    one DSSE envelope per decided operation
 ```
 
-Read the record back — the loader re-computes it from its inputs, which is what
-makes it evidence rather than a log line:
+Read the record back — loading it re-runs the language over the record's frozen
+inputs, which is what makes it evidence rather than a log line:
 
-```go
-rec, err := aicverifier.LoadEvidenceRecord("records/smoke-verify-9f13afb2...json")
-if err != nil { log.Fatal(err) }
-fmt.Println(rec.Verdict, rec.Reason)   // allow
+```bash
+go run ./examples/inspect-record records/smoke-verify-d355cc50...json
 ```
+
+```
+language   clc-v1 (CLC-1.5)
+operation  demo/example-v1:api:read
+verdict    allow
+inputs     sha-256:01XMUHOFFVE76Rc4NIn2IZnL_m0wyLyDt6pyWYvmvOE
+recomputed allow
+```
+
+An `allow_unresolved` record prints its residual obligations on the `unresolved`
+lines; the `recomputed` line is the check, and it is the same one
+`LoadEvidenceRecord` performs before returning.
 
 The `register` repository checks the same file from the outside:
 

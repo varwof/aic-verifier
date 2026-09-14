@@ -7,6 +7,8 @@ to do, and what was actually recorded** — for agents that present an AIC
 It is a small Go library, not a gateway: wrap your handler, or put the bundled
 reverse proxy in front of an API.
 
+[English](README.md) · [中文](README_CN.md)
+
 > **Status**: early. The API may change before the first stable release. It
 > evaluates **CLC-1.5**; see [docs/DESIGN.md](docs/DESIGN.md) for the layering and
 > [docs/evidence.md](docs/evidence.md) for the evidence side.
@@ -167,6 +169,7 @@ the profiles that pin the shape: [docs/evidence.md](docs/evidence.md).
 | [`examples/bearer-jwt-backend`](examples/bearer-jwt-backend) | the same service protected by `Authorization: Bearer` AIC-JWT |
 | [`examples/mcp-server`](examples/mcp-server) / [`mcp-behind-proxy`](examples/mcp-behind-proxy) | AIC-gated MCP server, and one behind the proxy |
 | [`examples/smoke-verify`](examples/smoke-verify) | minimal server used by the smoke test and the quick start |
+| [`examples/inspect-record`](examples/inspect-record) | read a decision record back and recompute its verdict |
 | [`examples/supervision-demo`](examples/supervision-demo) | approver + evidence exporter wiring used by the mTLS example |
 
 ## Related repositories
