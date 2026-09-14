@@ -28,8 +28,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/varwof/pkcs7 v0.1.0 h1:zA8ZZtJqosoUvzuqB1dapf0x6VazcmSE6j9IkyEbS0Q=
 github.com/varwof/pkcs7 v0.1.0/go.mod h1:5ZDmWtTHfGamWu4DP3EutQF1MOHoMzSRovXWYbSg8qQ=
-github.com/varwof/register v0.2.0 h1:J6E1oXHdD3D3pXTFCjNdh/9DkDSY5splrVBJlTdE3rs=
-github.com/varwof/register v0.2.0/go.mod h1:ZqfKRjVISqT2zahAsM2M4FPoy9VbtCNiVr0Pofec/EM=
+github.com/varwof/register v0.3.0 h1:mH7b8OlqC4MspmGEIcXuOAvOIIKO+zGKo79IXiguhRI=
+github.com/varwof/register v0.3.0/go.mod h1:ZqfKRjVISqT2zahAsM2M4FPoy9VbtCNiVr0Pofec/EM=
 github.com/varwof/types v0.6.0 h1:88xdcReaEfP/LAh4kNjhUYP824tqhI6UFLXeBk69oR8=
 github.com/varwof/types v0.6.0/go.mod h1:kMpDf3NfwRGSd7OKAH6m6U41A78ITv4RwniSs+1U3Zs=
 github.com/yosida95/uritemplate/v3 v3.0.2 h1:Ed3Oyj9yrmi9087+NczuL5BwkIc4wvTb5zIM+UJPGz4=
