@@ -1058,6 +1058,16 @@ func evidenceProblem(cfg *Config, req semantics.Requirement, sat semantics.Requi
 	if params.Nonce == "" || params.ID == "" {
 		return nil, fmt.Errorf("challenge randomness unavailable")
 	}
+	// The retry lower bound must survive into the carrier exactly like the
+	// residual-obligation path (buildChallengeForResult): the client is told
+	// when a corrected presentation is welcome, which is what guards the
+	// enforcement point against retry amplification.
+	if challengeCfg.RetryAfter > 0 {
+		params.Retry = &semantics.RetryTiming{
+			NotBefore: now.Add(challengeCfg.RetryAfter),
+			JitterSec: 0,
+		}
+	}
 	if cfg.RequiredOperations != nil && len(cfg.RequiredOperations) > 0 {
 		digest, err := semantics.DigestOf(cfg.RequiredOperations)
 		if err != nil {

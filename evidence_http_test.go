@@ -33,10 +33,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/varwof/register/semantics"
 	pki "github.com/varwof/types"
 )
 
@@ -375,8 +377,69 @@ func TestEvidenceHTTPDisabledEmitsNothing(t *testing.T) {
 	}
 }
 
-// findRecordFile returns the path of a decision (admission==false) or an
-// admission (admission==true) record file written to the records dir.
+// TestEvidenceRefusalMapsRetryBoundToHeaderAndBody: 需求未满足的证据拒绝若配置了
+// ChallengeConfig.RetryAfter，挑战的 retry 下限必须同时落到 JSON 的
+// retry_timing 与 HTTP 的 Retry-After 头（与残余义务路径一致，执业谱驱动重试节流）。
+func TestEvidenceRefusalMapsRetryBoundToHeaderAndBody(t *testing.T) {
+	ca := newHTTPTestCA(t)
+	client := ca.issueAIC(t, "agent-e2e-retry",
+		[]pki.Capability{{SchemeId: "std/database-v1", CapabilityId: "query:SELECT", Parameters: []byte(`{"limit":10}`)}})
+
+	var captured *AuthError
+	cfg := &Config{
+		CACertFile:          ca.writePEM(t),
+		AuthMode:            MTLSOnly,
+		RequireAIC:          true,
+		EvidenceRequirement: wireRequirement(),
+		EvidenceFacts:       func(*http.Request, *AuthContext) ([]semantics.EvidenceFact, error) { return nil, nil },
+		Challenges: &ChallengeConfig{
+			TTL:        5 * time.Minute,
+			Audience:   "https://gateway-a.example",
+			RetryAfter: 30 * time.Second,
+			NewID:      func() string { return "ch_retry" },
+			NewNonce:   func() string { return "nonce-0123456789" },
+		},
+		Hooks: &Hooks{Denied: func(_ *http.Request, ae *AuthError) { captured = ae }},
+	}
+	handler, err := cfg.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	url := startMTLSEvidenceTest(t, ca, handler)
+
+	resp, body := doMTLSEvidenceTest(t, url, client)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+
+	// HTTP 层：Retry-After 必须是挑战下限的秒数（30s 配置 → 30）。
+	retryAfter, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || retryAfter <= 0 || retryAfter > 31 {
+		t.Errorf("Retry-After = %q, want 1..31 (mapped from the 30s lower bound)", resp.Header.Get("Retry-After"))
+	}
+	if !strings.Contains(body, "retry_timing") {
+		t.Errorf("problem body must carry retry_timing, got: %s", body)
+	}
+
+	// 结构化层：挑战的 Retry 下限为 UTC 的 now+30s。
+	if captured == nil || captured.Problem == nil || captured.Problem.Challenge == nil {
+		t.Fatal("the refusal must carry a challenge")
+	}
+	retry := captured.Problem.Challenge.Retry
+	if retry == nil {
+		t.Fatal("the evidence challenge must carry a retry lower bound")
+	}
+	if retry.NotBefore.Location() != time.UTC {
+		t.Errorf("NotBefore location = %v, want UTC", retry.NotBefore.Location())
+	}
+	lo := time.Now().UTC().Add(29 * time.Second)
+	hi := time.Now().UTC().Add(32 * time.Second)
+	if retry.NotBefore.Before(lo) || retry.NotBefore.After(hi) {
+		t.Errorf("NotBefore = %s, want now+30s (±2s)", retry.NotBefore.Format(time.RFC3339))
+	}
+}
 func findRecordFile(t *testing.T, dir string, admission bool) (string, error) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
