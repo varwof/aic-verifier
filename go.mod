@@ -18,3 +18,7 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/text v0.40.0 // indirect
 )
+
+// 临时：本地开发期使用兄弟目录的 register（含 DecisionRecord 与义务判定 API）。
+// 发布前必须改成版本化 require（见 dev-docs/aic/zh/16-next-work-prompt.md A1/A3）。
+replace github.com/varwof/register => ../register
