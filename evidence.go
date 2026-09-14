@@ -11,9 +11,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/varwof/register/semantics"
 	pki "github.com/varwof/types"
 )
 
@@ -96,11 +98,77 @@ type EvidenceCapability struct {
 
 // EvidenceDecision is the PDP/PEP decision record (v0.1 §3 decision).
 type EvidenceDecision struct {
-	Decision              string   `json:"decision,omitempty"` // allow | deny
-	MatchedPolicy         string   `json:"matchedPolicy,omitempty"`
-	ReasonCodes           []string `json:"reasonCodes,omitempty"`
-	EvaluatedCapabilities []string `json:"evaluatedCapabilities,omitempty"`
-	PdpContext            string   `json:"pdpContext,omitempty"`
+	// Decision mirrors the CLC verdict.  When Record is present this field is
+	// derived from it (allow | allow_unresolved | deny) and MUST NOT disagree:
+	// a bundle whose summary contradicts its record is not evidence.
+	Decision string `json:"decision,omitempty"`
+	// RecordDigest is the record's input digest (hex) — the stable identifier
+	// of "which decision this bundle is about".
+	RecordDigest string `json:"recordDigest,omitempty"`
+	// Record is the CLC Decision Record itself: frozen inputs, verdict and
+	// residual obligations, independently re-computable by any holder.  The
+	// other fields in this section are a reader's summary of it; the record is
+	// the authority.
+	Record                *semantics.DecisionRecord `json:"record,omitempty"`
+	MatchedPolicy         string                    `json:"matchedPolicy,omitempty"`
+	ReasonCodes           []string                  `json:"reasonCodes,omitempty"`
+	EvaluatedCapabilities []string                  `json:"evaluatedCapabilities,omitempty"`
+	PdpContext            string                    `json:"pdpContext,omitempty"`
+}
+
+// ApplyRecord attaches a CLC decision record to this section and derives the
+// summary fields from it.  Deriving (rather than trusting the audit text) is
+// what keeps the bundle from carrying a decision of its own.
+func (d *EvidenceDecision) ApplyRecord(rec *semantics.DecisionRecord) error {
+	if rec == nil {
+		return nil
+	}
+	if err := rec.Verify(); err != nil {
+		return fmt.Errorf("evidence_decision: record does not reproduce: %w", err)
+	}
+	d.Record = rec
+	d.RecordDigest = hex.EncodeToString(rec.InputDigest.Value)
+	d.Decision = rec.Verdict
+	d.ReasonCodes = nil
+	if rec.Reason != "" {
+		d.ReasonCodes = append(d.ReasonCodes, canonicalReasonCode(rec.Reason))
+	}
+	for _, u := range rec.Constraints.Unresolved {
+		d.ReasonCodes = append(d.ReasonCodes, "unresolved:"+u)
+	}
+	return nil
+}
+
+// CheckDecisions verifies that the bundle's decision section agrees with the
+// record it carries (when it carries one).  A bundle without a record is not
+// wrong, but it is a report — not replayable evidence.
+func (b *EvidenceBundle) CheckDecisions() error {
+	if b == nil {
+		return fmt.Errorf("evidence_bundle: nil")
+	}
+	rec := b.Decision.Record
+	if rec == nil {
+		return nil
+	}
+	if err := rec.Verify(); err != nil {
+		return fmt.Errorf("evidence_bundle: %w", err)
+	}
+	if want := hex.EncodeToString(rec.InputDigest.Value); b.Decision.RecordDigest != want {
+		return fmt.Errorf("evidence_bundle: record digest %q does not match the record (%s)", b.Decision.RecordDigest, want)
+	}
+	if b.Decision.Decision != rec.Verdict {
+		return fmt.Errorf("evidence_bundle: decision %q contradicts the record verdict %q", b.Decision.Decision, rec.Verdict)
+	}
+	return nil
+}
+
+// canonicalReasonCode mirrors the register runner's rule: the stable code is
+// everything before the first ':'.
+func canonicalReasonCode(s string) string {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // EvidenceSupervisionEvent is one human-intervention event (v0.1 §3
@@ -151,6 +219,13 @@ type FileEvidenceExporter struct {
 	// supervision is unavailable; querying with IncludeSupervision then yields
 	// no supervision events.
 	SupervisionFile string
+	// EvidenceDir is the evidence record directory (the FileSink directory).
+	// When set and no Record was passed in the query, the exporter resolves the
+	// anchor from the audit chain (record_digest), loads the decision record
+	// envelope by digest and attaches it to the bundle.  A digest that resolves
+	// to nothing is a gap: the export fails instead of silently degrading to a
+	// report-only bundle.
+	EvidenceDir string
 	// Generator is the bundle.generator label; empty defaults to the package
 	// version.
 	Generator string
@@ -197,6 +272,25 @@ func (e *FileEvidenceExporter) Export(ctx context.Context, q EvidenceQuery) (*Ev
 		Signatures: make(map[string]json.RawMessage),
 	}
 	e.fillFromAudit(bundle, entries, q, now)
+	if err := bundle.Decision.ApplyRecord(q.Record); err != nil {
+		return nil, err
+	}
+	// Mutual anchoring: when the deployment records evidence and the audit
+	// chain pins a record digest but the caller did not hand one over, resolve
+	// the record by digest from the evidence directory.  A missing envelope is
+	// a gap, not a report-only fallback.
+	if q.Record == nil && bundle.Decision.RecordDigest != "" {
+		if e.EvidenceDir == "" {
+			return nil, fmt.Errorf("evidence_exporter: record %s pinned by audit (%s) but EvidenceDir is not set — cannot resolve it, refusing to export a report-only bundle", bundle.Decision.RecordDigest, e.AuditFile)
+		}
+		rec, err := e.resolveRecordByDigest(bundle.Decision.RecordDigest)
+		if err != nil {
+			return nil, err
+		}
+		if err := bundle.Decision.ApplyRecord(rec); err != nil {
+			return nil, err
+		}
+	}
 
 	if q.IncludeSupervision {
 		sup, err := readSupervisionLines(e.SupervisionFile, q)
@@ -280,6 +374,30 @@ func canonicalize(v any) (any, error) {
 	return v, nil
 }
 
+// resolveRecordByDigest loads the CLC decision record envelope whose input
+// digest is digest from EvidenceDir.  Files that are not decision-record
+// envelopes (admission/outcome records) are skipped.  A digest that matches no
+// decision record is an evidence gap and fails the export.
+func (e *FileEvidenceExporter) resolveRecordByDigest(digest string) (*semantics.DecisionRecord, error) {
+	entries, err := os.ReadDir(e.EvidenceDir)
+	if err != nil {
+		return nil, fmt.Errorf("evidence_exporter: read evidence dir %s: %w", e.EvidenceDir, err)
+	}
+	for _, de := range entries {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
+			continue
+		}
+		rec, err := LoadEvidenceRecord(filepath.Join(e.EvidenceDir, de.Name()))
+		if err != nil {
+			continue
+		}
+		if hex.EncodeToString(rec.InputDigest.Value) == digest {
+			return rec, nil
+		}
+	}
+	return nil, fmt.Errorf("evidence_exporter: decision record %s not found under %s (evidence gap)", digest, e.EvidenceDir)
+}
+
 // fillFromAudit derives the operation/subject/authorization/decision and the
 // audit chain from the exported audit lines.
 func (e *FileEvidenceExporter) fillFromAudit(bundle *EvidenceBundle, entries []auditChainLine, q EvidenceQuery, now time.Time) {
@@ -354,6 +472,9 @@ func (e *FileEvidenceExporter) fillFromAudit(bundle *EvidenceBundle, entries []a
 		}
 
 		dec.Decision = op.Outcome
+		if first.RecordDigest != "" {
+			dec.RecordDigest = first.RecordDigest
+		}
 		if dec.Decision == "deny" {
 			dec.ReasonCodes = []string{"param-out-of-bound"}
 			if first.DenyReason != "" {

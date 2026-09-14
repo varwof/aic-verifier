@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/varwof/register/semantics"
 	pki "github.com/varwof/types"
 )
 
@@ -151,6 +152,12 @@ type EvidenceQuery struct {
 	// IncludeSupervision merges supervision events into the bundle (default
 	// false keeps the bundle audit-only).
 	IncludeSupervision bool
+	// Record is the CLC decision record this bundle is about.  When set, it is
+	// attached to the bundle's decision section as the authority, and the
+	// summary fields (Decision, ReasonCodes) are derived from it rather than
+	// from the audit text.  Callers obtain it from the evidence sink (see
+	// LoadEvidenceRecord).
+	Record *semantics.DecisionRecord
 }
 
 // EvidenceExporter produces an evidence bundle (evidence-bundle v0.1) for a

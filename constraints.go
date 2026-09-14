@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -589,5 +590,67 @@ func ConstraintRecheckLoop(aicConstraints, paConstraints []Capability, clientIP 
 			}
 			return
 		}
+	}
+}
+
+// ConstraintToCapability is the inverse of ConstraintStrings: it maps a CLC
+// constraint string back to the (scheme, capability, parameters) triple the
+// connection-level registry evaluates.  A string this SDK cannot map is
+// reported as false so callers fail closed.
+func ConstraintToCapability(c string) (Capability, bool) {
+	parts := strings.Split(c, ":")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return Capability{}, false
+	}
+	cap := Capability{SchemeId: parts[0]}
+	switch parts[1] {
+	case "time", "network":
+		// `<scheme>:<type>:<crumb>:<json>` — the crumb ("window"/"cidr") is part
+		// of the capability id in the extension encoding.
+		if len(parts) < 4 {
+			return Capability{}, false
+		}
+		cap.CapabilityId = parts[1] + ":" + parts[2]
+		cap.Parameters = []byte(strings.Join(parts[3:], ":"))
+	default:
+		if len(parts) == 2 {
+			cap.CapabilityId = parts[1]
+			return cap, true
+		}
+		cap.CapabilityId = parts[1]
+		cap.Parameters = []byte(strings.Join(parts[2:], ":"))
+	}
+	return cap, true
+}
+
+// ConnectionConstraintEvaluator returns an UnresolvedEvaluator that discharges
+// the obligations the connection-level constraint registry can evaluate for the
+// given client IP (source CIDRs, time windows, and whatever else is registered).
+//
+// It exists because the connection-level check and the language-level obligation
+// are two halves of one rule: the language *declares* the constraint, and this
+// evaluator *discharges* it.  Passing it is an explicit act — a deployment that
+// does not pass it keeps the §8.4 default, which is fail-closed — so the release
+// is a declared policy rather than an implicit bypass.  Anything the registry
+// cannot evaluate (for example `max_rows`) is not discharged here: return false
+// and let the caller decide.
+func ConnectionConstraintEvaluator(clientIP string) func(op Operation, unresolved []string) bool {
+	return func(_ Operation, unresolved []string) bool {
+		for _, c := range unresolved {
+			cap, ok := ConstraintToCapability(c)
+			if !ok {
+				return false
+			}
+			// The registry must actually have an evaluator for this type: a
+			// successful check for an unknown type only means the non-strict
+			// path ignored it, and ignoring is not discharging.
+			if _, err := globalConstraintRegistry.Find(cap.CapabilityId); err != nil {
+				return false
+			}
+			if err := CheckAuthorizationConstraints([]Capability{cap}, clientIP); err != nil {
+				return false
+			}
+		}
+		return true
 	}
 }

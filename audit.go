@@ -83,6 +83,11 @@ type AuditEntry struct {
 	// PolicyVersion is the policy version effective at decision time (Task 5a: binding decision records to policy version).
 	// 0 when PolicyManager is not enabled (omitempty omits from output).
 	PolicyVersion uint64 `json:"policy_version,omitempty"`
+	// RecordDigest is the input digest (hex) of the evidence record this
+	// decision produced (refs[0].Digest).  It pins the audit line to the
+	// replayable record chain so the two no longer drift apart; empty when the
+	// decision produced no record.
+	RecordDigest string `json:"record_digest,omitempty"`
 }
 
 // SignedAuditEntry is an audit entry with TSA timestamp signature.
@@ -308,11 +313,21 @@ func (l *AuditLogger) File() string {
 	return l.file
 }
 
-// Close closes the audit log writer, draining buffered entries.
+// Close closes the audit log writer, draining buffered entries.  It is
+// idempotent: closing an already-closed logger returns nil instead of
+// re-draining the closed channel (which would spin and write garbage forever).
 func (l *AuditLogger) Close() error {
 	if l == nil || l.w == nil {
 		return nil
 	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	l.mu.Unlock()
+
 	l.stopped.Store(true)
 	// Drain any buffered entries before closing the channel so pending audit
 	// records are not silently lost (M6).
@@ -323,9 +338,6 @@ func (l *AuditLogger) Close() error {
 		default:
 			close(l.entries)
 			<-l.done
-			l.mu.Lock()
-			defer l.mu.Unlock()
-			l.closed = true
 			return l.w.Close()
 		}
 	}

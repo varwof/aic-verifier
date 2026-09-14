@@ -60,6 +60,16 @@ type PipelineConfig struct {
 	// allow_unresolved CLC decisions; forwarded to AdmissionConfig (see
 	// AdmissionConfig.UnresolvedEvaluator).
 	UnresolvedEvaluator func(op Operation, unresolved []string) bool
+	// DischargeObligations / ObligationsUnderstood enable the strict
+	// consumer-side obligation rule; forwarded to AdmissionConfig (see
+	// AdmissionConfig.DischargeObligations).
+	DischargeObligations  bool
+	ObligationsUnderstood []string
+	// RequireFreshDecisionContext / DecisionContext pin the RATS §10 freshness
+	// input; forwarded to AdmissionConfig (see
+	// AdmissionConfig.RequireFreshDecisionContext).
+	RequireFreshDecisionContext bool
+	DecisionContext             *semantics.DecisionContext
 	// DisallowRepresentative disallows delegated representative mode.
 	DisallowRepresentative bool
 	// RequireUserPermission requires user authorization signature.
@@ -279,29 +289,43 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 	}
 
 	admit := CheckAdmission(clientCert, AdmissionConfig{
-		RequireAIC:                cfg.RequireAIC,
-		RequiredProtocol:          cfg.RequiredProtocol,
-		RequiredRuleId:            cfg.RequiredRuleId,
-		RequiredCapabilities:      cfg.RequiredCapabilities,
-		Operations:                cfg.Operations,
-		UnresolvedEvaluator:       cfg.UnresolvedEvaluator,
-		DisallowRepresentative:    cfg.DisallowRepresentative,
-		RequireUserPermission:     cfg.RequireUserPermission,
-		RejectOverflow:            cfg.RejectOverflow,
-		RequireUserAuth:           cfg.RequireUserAuth,
-		EnforceCapSizeConstraints: cfg.EnforceCapSizeConstraints,
-		EnforceSize32:             cfg.EnforceSize32,
-		NonceCache:                cfg.NonceCache,
-		UserCert:                  cfg.UserCert,
-		UserCertResolver:          cfg.UserCertResolver,
-		ClientIP:                  cfg.ClientIP,
-		EnforceConstraints:        cfg.EnforceConstraints,
-		StrictConstraints:         cfg.StrictConstraints,
-		AuditLogger:               cfg.AuditLogger,
-		CredentialBundle:          cfg.CredentialBundle,
+		RequireAIC:                  cfg.RequireAIC,
+		RequiredProtocol:            cfg.RequiredProtocol,
+		RequiredRuleId:              cfg.RequiredRuleId,
+		RequiredCapabilities:        cfg.RequiredCapabilities,
+		Operations:                  cfg.Operations,
+		UnresolvedEvaluator:         cfg.UnresolvedEvaluator,
+		DischargeObligations:        cfg.DischargeObligations,
+		ObligationsUnderstood:       cfg.ObligationsUnderstood,
+		RequireFreshDecisionContext: cfg.RequireFreshDecisionContext,
+		DecisionContext:             cfg.DecisionContext,
+		DisallowRepresentative:      cfg.DisallowRepresentative,
+		RequireUserPermission:       cfg.RequireUserPermission,
+		RejectOverflow:              cfg.RejectOverflow,
+		RequireUserAuth:             cfg.RequireUserAuth,
+		EnforceCapSizeConstraints:   cfg.EnforceCapSizeConstraints,
+		EnforceSize32:               cfg.EnforceSize32,
+		NonceCache:                  cfg.NonceCache,
+		UserCert:                    cfg.UserCert,
+		UserCertResolver:            cfg.UserCertResolver,
+		ClientIP:                    cfg.ClientIP,
+		EnforceConstraints:          cfg.EnforceConstraints,
+		StrictConstraints:           cfg.StrictConstraints,
+		AuditLogger:                 cfg.AuditLogger,
+		CredentialBundle:            cfg.CredentialBundle,
 	})
 	if admit.Decision != DecisionAllow {
-		return deny(admit.Reason)
+		// A refusal is auditable too: carry the decisions already made (and the
+		// authority they were made over) into the denied result, the same way
+		// CheckAdmission does.  Evidence emission and the challenge carrier both
+		// read these fields, and an empty list would silently turn a refusal
+		// into "nothing to record".
+		res := deny(admit.Reason)
+		res.AIC = admit.AIC
+		res.PrincipalAuthorization = admit.PrincipalAuthorization
+		res.Principal = admit.PrincipalUid
+		res.OperationDecisions = admit.OperationDecisions
+		return res
 	}
 
 	// Parameter-level boundary validation (P1-B-11/P2-B-05): AIC-declared parameters must not

@@ -22,6 +22,7 @@ package aicverifier
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/varwof/register/semantics"
 	pki "github.com/varwof/types"
 	"github.com/varwof/types/aicjwt"
 )
@@ -105,6 +107,54 @@ type Config struct {
 	// allow_unresolved CLC decisions; forwarded to PipelineConfig → AdmissionConfig.
 	// Set programmatically — not parsed from JSON.
 	UnresolvedEvaluator func(op Operation, unresolved []string) bool
+	// DischargeObligations / ObligationsUnderstood enable the strict
+	// consumer-side obligation rule (CLC §8.4 + XACML §2.13/§7.2.1); forwarded
+	// to PipelineConfig → AdmissionConfig.  Set programmatically — not parsed
+	// from JSON.
+	DischargeObligations  bool
+	ObligationsUnderstood []string
+	// RequireFreshDecisionContext / DecisionContext pin the RATS §10 freshness
+	// input for allowed operations; forwarded to PipelineConfig →
+	// AdmissionConfig.
+	RequireFreshDecisionContext bool
+	DecisionContext             *semantics.DecisionContext
+	// Challenges enables the CLC-CHALLENGE-v1 carrier: a denial caused by
+	// unmet §8.4 residual obligations is answered with 403 +
+	// application/problem+json carrying the challenge, and its retry lower
+	// bound is mapped to Retry-After.  nil (default) keeps the compact JSON
+	// error.
+	Challenges *ChallengeConfig
+	// ChallengeCarrier shapes the HTTP response for a refusal that carries a
+	// challenge.  nil (default) uses the built-in RFC 9457
+	// application/problem+json carrier.  A custom carrier may change the body
+	// shape; the SDK still sets Retry-After from the challenge's retry bound
+	// before delegating, so the lower bound survives regardless.
+	ChallengeCarrier ChallengeCarrier
+	// EvidenceRequirement is the relying party's evidence sufficiency bar
+	// (CLC-REQUIREMENT-v1).  The SDK never takes it from the request: it is this
+	// deployment's configuration.  When set, every admitted request is also
+	// evaluated against it (via EvidenceFacts), a refusal carries the machine
+	// readable challenge, and the emitted records bind the requirement digest.
+	EvidenceRequirement *semantics.Requirement
+	// EvidenceFacts supplies the evidence facts presented with a request.  The
+	// SDK does not parse evidence artifacts; the deployment hands over facts its
+	// own verifiers established (type, protected subject id, issuance time,
+	// whether it reached VERIFIED).  An error is fail-closed.
+	EvidenceFacts func(r *http.Request, ac *AuthContext) ([]semantics.EvidenceFact, error)
+	// EvidenceProfile names the evidence shape this deployment emits, e.g.
+	// "clc-decision+admission+outcome@1".  It is resolved at configuration time
+	// (an unknown name is a configuration error) and fills the shape parts of
+	// Evidence: which payloads are produced, whether records carry a freshness
+	// context and the source chain, and which requirement is bound.  Changing
+	// the emitted shape is a value here, not an edit to the decision path.
+	EvidenceProfile string
+	// Evidence, when set, freezes a CLC decision record for every decided
+	// operation and hands it to a sink (structured log by default, or one DSSE
+	// envelope per record on disk).  nil (default) emits nothing — a deployment
+	// that only decides online pays no bytes.  Records are produced per source
+	// (AIC capabilities, principal authorization); the combined verdict stays in
+	// AuthContext.
+	Evidence *EvidenceConfig
 	// DisallowRepresentative rejects DelegationRepresentative-mode AIC.
 	DisallowRepresentative bool
 	// RequireUserAuth requires DelegationAuthorization signature verification.
@@ -257,10 +307,12 @@ func (c *Config) Handler(next http.Handler) (http.Handler, error) {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, err := a.Authenticate(r)
 		if err != nil {
+			ae := asAuthError(err)
+			ae.Evidence = append(ae.Evidence, a.refusalEvidence(r, ae)...)
 			if a.cfg.Hooks != nil && a.cfg.Hooks.Denied != nil {
-				a.cfg.Hooks.Denied(r, asAuthError(err))
+				a.cfg.Hooks.Denied(r, ae)
 			}
-			a.writeError(w, err)
+			a.writeError(w, ae)
 			return
 		}
 		if ctx != nil {
@@ -325,6 +377,15 @@ type AuthContext struct {
 	Unresolved []string
 	// OperationDecisions is the per-operation CLC verdict detail (B3).
 	OperationDecisions []OperationDecision
+	// Evidence points at the decision records this admission produced (digest,
+	// verdict and, for file-like sinks, where it was written).  Empty when
+	// evidence emission is not configured.
+	Evidence []RecordRef
+	// Satisfaction is the evidence-requirement evaluation for this request
+	// (nil when no requirement is configured): satisfied / violated / unknown,
+	// with the per-constraint detail and the missing roles.  It answers "was
+	// enough evidence presented", not "is this action authorized".
+	Satisfaction *semantics.RequirementResult
 }
 
 type authCtxKey struct{}
@@ -361,6 +422,18 @@ func newAuthenticator(c *Config) (*authenticator, error) {
 		ocsp:       c.OCSPCache,
 		audit:      c.AuditLogger,
 		nonceCache: c.NonceCache,
+	}
+
+	if c.EvidenceProfile != "" {
+		profile, err := LookupEvidenceProfile(c.EvidenceProfile)
+		if err != nil {
+			return nil, err
+		}
+		ev, err := profile.Apply(c.Evidence)
+		if err != nil {
+			return nil, err
+		}
+		c.Evidence = ev
 	}
 
 	mode := c.authMode()
@@ -448,29 +521,46 @@ func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
 	}
 
 	result := RunAccessPipeline(chain, &PipelineConfig{
-		CRLCache:                 a.crl,
-		OCSPCache:                a.ocsp,
-		CheckScope:               CheckFullChain,
-		RequireAIC:               a.cfg.RequireAIC,
-		RequiredCapabilities:     a.cfg.RequiredCapabilities,
-		Operations:               a.cfg.RequiredOperations,
-		UnresolvedEvaluator:      a.cfg.UnresolvedEvaluator,
-		DisallowRepresentative:   a.cfg.DisallowRepresentative,
-		RequireUserAuth:          a.cfg.RequireUserAuth,
-		ClientIP:                 clientIPOf(r),
-		EnforceConstraints:       a.cfg.EnforceConstraints,
-		StrictConstraints:        true,
-		CapabilityPluginRegistry: a.cfg.PluginRegistry,
-		CapabilityRegistry:       a.cfg.CapabilityRegistry,
-		AuditLogger:              a.audit,
-		NonceCache:               a.nonceCache,
-		UserCert:                 a.cfg.UserCert,
-		UserCertResolver:         a.cfg.UserCertResolver,
-		HTTPFacts:                httpFactsFor(r, opBody),
+		CRLCache:                    a.crl,
+		OCSPCache:                   a.ocsp,
+		CheckScope:                  CheckFullChain,
+		RequireAIC:                  a.cfg.RequireAIC,
+		RequiredCapabilities:        a.cfg.RequiredCapabilities,
+		Operations:                  a.cfg.RequiredOperations,
+		UnresolvedEvaluator:         a.cfg.UnresolvedEvaluator,
+		DischargeObligations:        a.cfg.DischargeObligations,
+		ObligationsUnderstood:       a.cfg.ObligationsUnderstood,
+		RequireFreshDecisionContext: a.cfg.RequireFreshDecisionContext,
+		DecisionContext:             a.cfg.DecisionContext,
+		DisallowRepresentative:      a.cfg.DisallowRepresentative,
+		RequireUserAuth:             a.cfg.RequireUserAuth,
+		ClientIP:                    clientIPOf(r),
+		EnforceConstraints:          a.cfg.EnforceConstraints,
+		StrictConstraints:           true,
+		CapabilityPluginRegistry:    a.cfg.PluginRegistry,
+		CapabilityRegistry:          a.cfg.CapabilityRegistry,
+		AuditLogger:                 a.audit,
+		NonceCache:                  a.nonceCache,
+		UserCert:                    a.cfg.UserCert,
+		UserCertResolver:            a.cfg.UserCertResolver,
+		HTTPFacts:                   httpFactsFor(r, opBody),
 	})
 	if !result.Granted {
 		a.log.Warn("aic-verifier: admission denied", "reason", result.DenyReason, "path", r.URL.Path)
-		return nil, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: result.DenyReason}
+		// A refused operation is evidence too: record the decisions that were
+		// made before denying (same per-source shape as the allow path).
+		refs, evErr := a.emitEvidence(r, clientCert, result, EvidenceRefused)
+		a.auditAdmission(r, clientCert, refs, true, result.DenyReason)
+		if evErr != nil && a.cfg.Evidence != nil && a.cfg.Evidence.Strict {
+			return nil, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_unavailable: " + evErr.Error(), Evidence: refs}
+		}
+		// A denial that evidence can fix carries a challenge; anything else
+		// keeps the plain error (a challenge must not dress up a hard refusal).
+		problem, err := problemForResult(result, a.cfg.Challenges, result.DenyReason)
+		if err != nil {
+			a.log.Warn("aic-verifier: challenge build failed", "error", err, "path", r.URL.Path)
+		}
+		return nil, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: result.DenyReason, Problem: problem, Evidence: refs}
 	}
 
 	ac := &AuthContext{
@@ -487,6 +577,15 @@ func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
 		Unresolved:         result.CLCUnresolved,
 		OperationDecisions: result.OperationDecisions,
 	}
+	// The admitted call leaves a replayable record: freeze the per-source
+	// decisions before anything downstream can act on them.
+	evidenceRefs, evErr := a.emitEvidence(r, clientCert, result, EvidenceAdmitted)
+	if evErr != nil && a.cfg.Evidence != nil && a.cfg.Evidence.Strict {
+		return nil, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_unavailable: " + evErr.Error(), Evidence: evidenceRefs}
+	}
+	ac.Evidence = evidenceRefs
+	a.auditAdmission(r, clientCert, evidenceRefs, false, "")
+
 	if result.AIC != nil {
 		for _, cap := range result.AIC.Capabilities {
 			ac.Capabilities = append(ac.Capabilities, cap.CapabilityId)
@@ -500,6 +599,15 @@ func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
 		for _, g := range pa.Grants {
 			ac.Capabilities = append(ac.Capabilities, g.CapabilityId)
 		}
+	}
+
+	// Evidence sufficiency (CLC-E): the deployment's requirement is evaluated
+	// against the facts it presented.  Satisfied admits; violated or unknown
+	// refuses, and the refusal carries the machine-readable challenge saying
+	// what is still needed.  This is not the authorization decision — it is the
+	// "is there enough evidence" half, and neither stands in for the other.
+	if err := a.checkEvidenceRequirement(r, ac, result); err != nil {
+		return nil, err
 	}
 
 	// Mid-operation supervision (design draft §3, decision-path hook before
@@ -678,12 +786,10 @@ func httpFactsFor(r *http.Request, body []byte) *HTTPFacts {
 	}
 }
 
-// writeError writes a JSON error response.
+// writeError writes the refusal: a problem document when the AuthError carries
+// one (the CLC challenge carrier), a compact JSON error otherwise.
 func (a *authenticator) writeError(w http.ResponseWriter, err error) {
-	ae := asAuthError(err)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(ae.Status)
-	io.WriteString(w, fmt.Sprintf(`{"code":%q,"message":%q}`+"\n", ae.Code.String(), ae.Message))
+	writeAuthError(w, asAuthError(err), a.cfg)
 }
 
 // ErrorCode identifies the kind of admission failure.
@@ -723,6 +829,23 @@ type AuthError struct {
 	Code    ErrorCode
 	Status  int
 	Message string
+	// Stage, when set, overrides the AdmissionRecord stage for this refusal
+	// (the default is Code.String()).  The middleware's pre-language refusals
+	// keep the default; the reverse proxy names the layer that refused
+	// ("route_denied", "method_not_allowed", "capability_denied", ...) so one
+	// proxy can tell its refusals apart.
+	Stage string
+	// Evidence points at the records a refused request still produced, so the
+	// caller can log or forward them next to the challenge.
+	Evidence []RecordRef
+	// Problem, when set, is written as an RFC 9457 problem document instead of
+	// the SDK's compact JSON error — the carrier for CLC-CHALLENGE-v1.
+	Problem *ProblemDetails
+	// Satisfaction, when the refusal is an unsatisfied evidence requirement, is
+	// the machine-readable result (violated / unknown with the missing roles),
+	// so a caller can act on *why* the evidence bar was not met without parsing
+	// the challenge back out.
+	Satisfaction *semantics.RequirementResult
 }
 
 func (e *AuthError) Error() string { return e.Message }
@@ -735,4 +858,224 @@ func asAuthError(err error) *AuthError {
 		return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "admission failed"}
 	}
 	return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: err.Error()}
+}
+
+// auditAdmission writes the admission verdict to the audit log, pinning the
+// decision's evidence record (record_digest = refs[0].Digest) so the audit
+// chain and the record chain cross-reference each other.  No-op when audit
+// logging is disabled or the decision produced no record.
+func (a *authenticator) auditAdmission(r *http.Request, clientCert *x509.Certificate, refs []RecordRef, denied bool, reason string) {
+	if a.audit == nil || len(refs) == 0 {
+		return
+	}
+	entry := NewAuditEntryFromConn(clientIPOf(r), r.Method, r.URL.Path, clientCert)
+	if denied {
+		entry.Action = string(ActionDenied)
+		entry.DenyReason = reason
+	}
+	entry.TraceId = r.Header.Get("X-Request-Id")
+	entry.RecordDigest = refs[0].Digest
+	a.audit.Log(entry)
+}
+
+// emitEvidence freezes a decision record for every operation this admission
+// decided, per authority source, and hands it to the configured sink.  It
+// returns where the records went, so the caller can point at them.  It is a
+// no-op when evidence is not configured.
+//
+// An emission failure is reported through EvidenceConfig.OnError (a deployment
+// wants to know about evidence gaps, not only about requests) and returned to
+// the caller for the Strict decision.
+func (a *authenticator) emitEvidence(r *http.Request, clientCert *x509.Certificate, result *PipelineResult, outcome EvidenceOutcome) ([]RecordRef, error) {
+	cfg := a.cfg.Evidence
+	if cfg == nil || result == nil || len(result.OperationDecisions) == 0 {
+		return nil, nil
+	}
+	ctx := EvidenceContext{
+		RecorderID: cfg.RecorderID,
+		Principal:  result.Principal,
+		AgentID:    result.AgentId,
+		Serial:     result.Serial,
+		Outcome:    outcome,
+		At:         cfg.now(),
+		Facts:      a.admissionFacts(r, result.OperationDecisions),
+	}
+	if r != nil {
+		ctx.Method = r.Method
+		ctx.Path = r.URL.Path
+		ctx.TraceID = r.Header.Get("X-Request-Id")
+	}
+	if cfg.Requirement == nil {
+		cfg.Requirement = a.cfg.EvidenceRequirement
+	}
+	refs, err := EmitDecisionRecords(cfg, ctx, clientCert, result.AIC, result.PrincipalAuthorization, a.cfg.UserCert, result.OperationDecisions)
+	if err != nil {
+		cfg.gap()
+		if cfg.OnError != nil {
+			cfg.OnError(ctx, err)
+		} else {
+			logger := a.log
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Error("aic-verifier: evidence emission failed", "error", err, "path", ctx.Path)
+		}
+	}
+	return refs, err
+}
+
+// refusalEvidence records a refusal that did not already produce records.  The
+// pipeline's language-layer refusals carry CLC DecisionRecords in
+// AuthError.Evidence; everything else (credential, chain, revocation, AIC
+// parsing, missing capability) reaches this single point, where it is recorded
+// as an AdmissionRecord — an honest payload, because those refusals never
+// reached the language layer.
+//
+// The guard is deliberate: one refusal, one record.  Adding an admission record
+// on top of CLC records would describe the same decision twice, in two types.
+func (a *authenticator) refusalEvidence(r *http.Request, ae *AuthError) []RecordRef {
+	cfg := a.cfg.Evidence
+	if cfg == nil || ae == nil || len(ae.Evidence) > 0 {
+		return nil
+	}
+	ctx := EvidenceContext{
+		RecorderID: cfg.RecorderID,
+		Outcome:    EvidenceRefused,
+		At:         cfg.now(),
+	}
+	if r != nil {
+		ctx.Method = r.Method
+		ctx.Path = r.URL.Path
+		ctx.TraceID = r.Header.Get("X-Request-Id")
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			ctx.Serial = r.TLS.PeerCertificates[0].SerialNumber.Text(16)
+		}
+	}
+	ctx.Facts = append(ctx.Facts, a.admissionFacts(r, nil)...)
+
+	return recordRefusal(cfg, a.log, ctx, ae)
+}
+
+// admissionFacts returns the content-addressed business facts a connection
+// already carries — the client leaf certificate and the operations it actually
+// asked CLC to decide (falling back to the deployment's RequiredOperations on
+// paths that never reached the operation loop) — in the same shape whether the
+// path wound up admitted or refused.  Only digests travel here; the material
+// stays where it was verified.
+func (a *authenticator) admissionFacts(r *http.Request, ods []OperationDecision) []AdmissionFact {
+	if r == nil {
+		return nil
+	}
+	var facts []AdmissionFact
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		leaf := r.TLS.PeerCertificates[0]
+		sum := sha256.Sum256(leaf.Raw)
+		facts = append(facts, AdmissionFact{
+			Type:   "client-cert",
+			Digest: semantics.Digest{Alg: semantics.DigestAlgSHA256, Value: sum[:]},
+			Note:   "leaf certificate presented on this connection",
+		})
+	}
+	ops := make([]semantics.Operation, 0, len(ods))
+	for _, od := range ods {
+		ops = append(ops, semantics.Operation{ID: od.ID, Params: od.Params})
+	}
+	if len(ops) == 0 {
+		ops = a.cfg.RequiredOperations
+	}
+	if len(ops) > 0 {
+		if digest, err := semantics.DigestOf(ops); err == nil {
+			facts = append(facts, AdmissionFact{
+				Type:   "requested-operations",
+				Digest: digest,
+				Note:   "operations this connection asked CLC to decide",
+			})
+		}
+	}
+	return facts
+}
+
+// checkEvidenceRequirement evaluates the configured CLC-REQUIREMENT-v1 against
+// the facts the deployment supplies for this request.  Anything that is not an
+// explicit "satisfied" refuses, and the refusal carries a challenge — the
+// machine-readable "what is still missing" — built from the requirement result.
+func (a *authenticator) checkEvidenceRequirement(r *http.Request, ac *AuthContext, result *PipelineResult) error {
+	req := a.cfg.EvidenceRequirement
+	if req == nil {
+		return nil
+	}
+	if err := req.Validate(); err != nil {
+		return &AuthError{Code: ErrConfig, Status: http.StatusForbidden, Message: "evidence_requirement_invalid: " + err.Error()}
+	}
+	var facts []semantics.EvidenceFact
+	if a.cfg.EvidenceFacts != nil {
+		var err error
+		facts, err = a.cfg.EvidenceFacts(r, ac)
+		if err != nil {
+			return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_facts_unavailable: " + err.Error()}
+		}
+	}
+	now := time.Now().UTC()
+	if a.cfg.Challenges != nil && a.cfg.Challenges.Now != nil {
+		now = a.cfg.Challenges.Now().UTC()
+	}
+	sat, err := semantics.EvaluateRequirement(*req, facts, semantics.EvidenceContext{Now: now})
+	if err != nil {
+		return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_requirement_error: " + err.Error()}
+	}
+	ac.Satisfaction = &sat
+	if sat.Satisfied() {
+		return nil
+	}
+
+	problem, err := evidenceProblem(a.cfg, *req, sat, result, now)
+	if err != nil {
+		logger := a.log
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("aic-verifier: evidence challenge build failed", "error", err, "path", r.URL.Path)
+	}
+	detail := fmt.Sprintf("evidence %s for requirement %s (missing roles: %v)", sat.Verdict, req.ID, sat.MissingRoles)
+	return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: detail, Problem: problem, Satisfaction: &sat}
+}
+
+// evidenceProblem turns an unsatisfied requirement into the RFC 9457 carrier,
+// reusing the same challenge shape as the residual-obligation path.
+func evidenceProblem(cfg *Config, req semantics.Requirement, sat semantics.RequirementResult, result *PipelineResult, now time.Time) (*ProblemDetails, error) {
+	challengeCfg := cfg.Challenges
+	if challengeCfg == nil {
+		return nil, nil
+	}
+	params := semantics.ChallengeParams{
+		ID:          challengeCfg.newID(),
+		Nonce:       challengeCfg.newNonce(),
+		Audience:    challengeCfg.Audience,
+		Now:         now,
+		TTL:         challengeCfg.TTL,
+		ObtainHints: challengeCfg.ObtainHints,
+	}
+	if params.Nonce == "" || params.ID == "" {
+		return nil, fmt.Errorf("challenge randomness unavailable")
+	}
+	if cfg.RequiredOperations != nil && len(cfg.RequiredOperations) > 0 {
+		digest, err := semantics.DigestOf(cfg.RequiredOperations)
+		if err != nil {
+			return nil, err
+		}
+		params.ActionDigest = digest
+	} else {
+		params.ActionDigest = semantics.DigestOfCanonical([]byte("admission"))
+	}
+	challenge, err := semantics.BuildChallengeFromRequirement(req, sat, params)
+	if err != nil {
+		return nil, err
+	}
+	return &ProblemDetails{
+		Type:      ProblemTypeEvidenceRequired,
+		Title:     "Authorization evidence required",
+		Status:    http.StatusForbidden,
+		Detail:    fmt.Sprintf("requirement %s is %s", req.ID, sat.Verdict),
+		Challenge: &challenge,
+	}, nil
 }

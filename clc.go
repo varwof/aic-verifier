@@ -34,6 +34,12 @@ type OperationDecision struct {
 	Verdict    string         `json:"verdict"` // semantics.VerdictAllow / VerdictDeny / VerdictAllowUR
 	Reason     string         `json:"reason,omitempty"`
 	Unresolved []string       `json:"unresolved,omitempty"`
+	// Grants are the effective grant set the operation was decided over: the
+	// AIC capability set on the delegated path, the principal's own grants on
+	// the direct path, each already carrying the connection's authorization
+	// constraints.  Surfacing them here means a downstream consumer can recompute
+	// the verdict without parsing an evidence record file.
+	Grants []semantics.Grant `json:"grants,omitempty"`
 	// Released is true when an allow_unresolved operation was admitted because
 	// the deployment's UnresolvedEvaluator confirmed the residual obligations.
 	Released bool `json:"released,omitempty"`
@@ -171,7 +177,9 @@ func AuthorizeOperation(aic *AIC, pa *PrincipalAuthorization, opID string, param
 		return semantics.Decision{}, fmt.Errorf("no capability source: AIC and PrincipalAuthorization are both absent")
 	}
 	if aic == nil {
-		return AuthorizeCapabilities(pa.Grants, opID, params)
+		// Direct authorization (human certificate, no AIC): the principal's own
+		// constraints bind here exactly as they do on the delegated path.
+		return AuthorizeCapabilitiesWithConstraints(pa.Grants, pa.AuthorizationConstraints, opID, params)
 	}
 	aisDec, err := AuthorizeCapabilitiesWithConstraints(aic.Capabilities, aic.AuthorizationConstraints, opID, params)
 	if err != nil {
@@ -180,51 +188,43 @@ func AuthorizeOperation(aic *AIC, pa *PrincipalAuthorization, opID string, param
 	if pa == nil {
 		return aisDec, nil
 	}
-	paDec, err := AuthorizeCapabilities(pa.Grants, opID, params)
+	// The principal's constraints bind the human/direct-authorization path the
+	// same way the AIC's bind the delegated path: they are declarations the
+	// language carries, not a per-connection check to be bypassed.  A constraint
+	// the consumer cannot discharge fails closed (§8.4), including the ones the
+	// connection-level registry has no evaluator for (e.g. max_rows).
+	paDec, err := AuthorizeCapabilitiesWithConstraints(pa.Grants, pa.AuthorizationConstraints, opID, params)
 	if err != nil {
 		return semantics.Decision{}, err
 	}
 	return combineDecisions(aisDec, paDec), nil
 }
 
-// combineDecisions intersects two decisions: deny wins, residual obligations
-// union, and allow only when both sides allowed outright.
-func combineDecisions(a, b semantics.Decision) semantics.Decision {
-	if a.Verdict == semantics.VerdictDeny {
-		return a
+// decisionGrants returns the effective grant set an operation was decided over,
+// in the same source priority as AuthorizeOperation: the AIC capability set on
+// the delegated path, the principal's grants on the direct path, each already
+// carrying the connection's authorization constraints.
+func decisionGrants(aic *AIC, pa *PrincipalAuthorization) []semantics.Grant {
+	recs := evidenceRecorders(aic, pa)
+	if grants, ok := recs["aic"]; ok {
+		return grants
 	}
-	if b.Verdict == semantics.VerdictDeny {
-		return b
-	}
-	if a.Verdict == semantics.VerdictAllowUR || b.Verdict == semantics.VerdictAllowUR {
-		unresolved := append(append([]string{}, a.Unresolved...), b.Unresolved...)
-		return semantics.Decision{
-			Verdict:    semantics.VerdictAllowUR,
-			Unresolved: dedupeSorted(unresolved),
-		}
-	}
-	return semantics.Decision{Verdict: semantics.VerdictAllow}
+	return recs["principal-authorization"]
 }
 
-func dedupeSorted(in []string) []string {
-	seen := make(map[string]bool, len(in))
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		if seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
+// combineDecisions intersects two decisions — the AIC capability set and the
+// principal's authorization — under the language's default combining algorithm:
+// deny wins, residual obligations union, allow only when both sides allowed
+// outright.  The rule itself lives in register/semantics (P7: define once,
+// consume everywhere) so this SDK cannot drift from the specified algorithm.
+func combineDecisions(a, b semantics.Decision) semantics.Decision {
+	combined, err := semantics.Combine(semantics.DefaultCombiningAlgorithm, a, b)
+	if err != nil {
+		// A pair that cannot be combined cannot authorize; report the stable
+		// reason instead of guessing at a verdict.
+		return semantics.Decision{Verdict: semantics.VerdictDeny, Reason: err.Error()}
 	}
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j] < out[j-1]; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return combined
 }
 
 // normalizeParams turns capability parameters (raw JSON bytes) or a caller's Go

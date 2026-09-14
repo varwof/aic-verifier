@@ -50,6 +50,10 @@ type AdmissionResult struct {
 	// deny path for the operation that caused it) so upstream can surface
 	// verdict / reason / unresolved to downstream.
 	OperationDecisions []OperationDecision
+	// Sources is the authorization chain this admission can prove it rested on
+	// (CLC SourceChain): the verified leaf certificate, plus the principal
+	// certificate when configured.  Nil when no certificate was presented.
+	Sources *semantics.SourceChain
 }
 
 // AdmissionConfig is the configuration for the admission engine.
@@ -78,6 +82,28 @@ type AdmissionConfig struct {
 	// obligations (semantics.Decision.Unresolved) at runtime.  nil (default)
 	// keeps fail-closed deny.
 	UnresolvedEvaluator func(op Operation, unresolved []string) bool
+	// DischargeObligations enables the strict consumer-side obligation rule of
+	// CLC §8.4 with XACML 3.0 §2.13/§7.2.1: before an allow_unresolved decision
+	// can be released, every obligation identity must be one this deployment
+	// understands and can and will discharge (ObligationsUnderstood).  An
+	// obligation it does not understand fails closed with obligation_unknown
+	// instead of being handed to UnresolvedEvaluator as opaque text.  false
+	// (default) keeps the legacy path, where UnresolvedEvaluator alone decides.
+	DischargeObligations bool
+	// ObligationsUnderstood lists the obligation (scheme,type) identities this
+	// deployment understands and can and will discharge, e.g.
+	// "varwof/constraint-v1:time".  Only consulted when DischargeObligations is
+	// true.
+	ObligationsUnderstood []string
+	// RequireFreshDecisionContext requires the deployment to pin a freshness
+	// context (RATS §10: explicit clock, nonce, or epoch id) and requires it to
+	// still be fresh when an operation is allowed.  A missing, stale, or
+	// future-dated context denies with a stable reason code; false (default)
+	// keeps the pre-context behaviour.
+	RequireFreshDecisionContext bool
+	// DecisionContext is the pinned freshness input (semantics.DecisionContext).
+	// Required when RequireFreshDecisionContext is set.
+	DecisionContext *semantics.DecisionContext
 	// DisallowRepresentative when set to true rejects DelegationRepresentative mode connections.
 	DisallowRepresentative bool
 	// RequireUserPermission when set to true rejects connections without UserPermission extension.
@@ -361,6 +387,14 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		result.PrincipalUid = aic.PrincipalUid.String()
 	}
 
+	// Authorization sources: only what this deployment can prove (certificate
+	// DER digests).  A chain that cannot be assembled is not fatal here — the
+	// decision stands on the verified certificate either way — but a chain
+	// that *is* assembled must validate (byte-backed edges only).
+	if sources, err := BuildSourceChain(cert, aic, cfg.UserCert); err == nil {
+		result.Sources = sources
+	}
+
 	// GAP-08/09/10/11/12: AIC field constraint unified validation
 	if aic != nil {
 		if err := ValidateAIC(aic); err != nil {
@@ -506,6 +540,21 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		}
 	}
 
+	// denyOp carries the decisions already made into the refusal, so a refusal
+	// is as auditable as an admission: evidence emission and the challenge
+	// carrier both read OperationDecisions, and the result docstring promises
+	// they survive the deny path.
+	denyOp := func(format string, args ...any) AdmissionResult {
+		return AdmissionResult{
+			Decision:               DecisionDeny,
+			Reason:                 fmt.Sprintf(format, args...),
+			AIC:                    result.AIC,
+			PrincipalAuthorization: result.PrincipalAuthorization,
+			PrincipalUid:           result.PrincipalUid,
+			OperationDecisions:     result.OperationDecisions,
+		}
+	}
+
 	// Concrete-operation authorization (CLC).  The id-only check above cannot
 	// see parameters, so a grant of {"tables":["a"]} and a request for
 	// {"tables":["a","b"]} look identical to it.  Each declared operation is
@@ -524,30 +573,40 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 			Verdict:    dec.Verdict,
 			Reason:     dec.Reason,
 			Unresolved: dec.Unresolved,
+			Grants:     decisionGrants(aic, result.PrincipalAuthorization),
 		}
 		result.OperationDecisions = append(result.OperationDecisions, od)
 		switch dec.Verdict {
 		case semantics.VerdictAllow:
 			// authorized outright
-		case semantics.VerdictDeny:
-			return AdmissionResult{
-				Decision: DecisionDeny,
-				Reason:   fmt.Sprintf("operation %s denied: %s", op.ID, dec.Reason),
+			if err := checkDecisionContext(cfg); err != nil {
+				return denyOp("operation %s: %v", op.ID, err)
 			}
+		case semantics.VerdictDeny:
+			return denyOp("operation %s denied: %s", op.ID, dec.Reason)
 		default:
 			// allow_unresolved is an independent verdict carrying §8.4 residual
 			// obligations; reading it as "allow" would fail open.
+			//
+			// Strict mode first applies the consumer-side rule (XACML §2.13:
+			// deny unless the consumer understands and can discharge every
+			// obligation), then the deployment's value-level confirmation.
+			if cfg.DischargeObligations {
+				if err := semantics.Discharge(dec, cfg.ObligationsUnderstood); err != nil {
+					return denyOp("operation %s: %v", op.ID, err)
+				}
+			}
 			if cfg.UnresolvedEvaluator != nil && cfg.UnresolvedEvaluator(op, dec.Unresolved) {
 				// The deployment confirmed the residual obligations; the operation
 				// is released but must still be honored at runtime. Only opt-in
 				// paths reach here — nil (default) keeps fail-closed deny.
+				if err := checkDecisionContext(cfg); err != nil {
+					return denyOp("operation %s: %v", op.ID, err)
+				}
 				result.OperationDecisions[len(result.OperationDecisions)-1].Released = true
 				continue
 			}
-			return AdmissionResult{
-				Decision: DecisionDeny,
-				Reason:   fmt.Sprintf("operation %s: %s (unresolved %v)", op.ID, dec.Verdict, dec.Unresolved),
-			}
+			return denyOp("operation %s: %s (unresolved %v)", op.ID, dec.Verdict, dec.Unresolved)
 		}
 	}
 
@@ -1075,4 +1134,21 @@ func currentPrincipalCert(cfg AdmissionConfig) *x509.Certificate {
 // accepted for backward compatibility.
 func isConstraintScheme(scheme string) bool {
 	return scheme == "varwof/constraint-v1" || scheme == "constraint" || scheme == "constraint-v1"
+}
+
+// checkDecisionContext enforces the RATS §10 freshness input when the
+// deployment requires one.  It is called only on paths that would otherwise
+// allow (or release) the operation, so a refusal is never masked by it.
+//
+// The clock is read here and nowhere else: the decision itself stays a pure
+// function of (grants, operation), and the instant it was appraised at is what
+// the context pins.
+func checkDecisionContext(cfg AdmissionConfig) error {
+	if !cfg.RequireFreshDecisionContext {
+		return nil
+	}
+	if cfg.DecisionContext == nil {
+		return semantics.ErrContextMissing
+	}
+	return cfg.DecisionContext.Fresh(time.Now().UTC())
 }
