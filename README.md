@@ -13,10 +13,6 @@ reverse proxy in front of an API.
 
 ## What it does
 
-```bash
-go get github.com/varwof/aic-verifier    # Go 1.26+, no cgo
-```
-
 Per request, one pipeline decides: certificate validity → CRL/OCSP → roles →
 AIC decision → capability ∩ (principal authorization) → parameter bounds →
 **allow / allow_unresolved / deny**, and (optionally) writes a decision record
@@ -24,33 +20,62 @@ you can recompute later.
 
 - **Two transports**: mTLS client certificate carrying the AIC extension, or
   `Authorization: Bearer <AIC-JWT>`.
-- **Two integration styles**: `AuthMiddleware` around your own handler, or
-  `Server` as a reverse proxy that injects `X-AIC-*` identity headers.
+- **Two integration styles**: `(*Config).Handler` / `AuthMiddleware` around your
+  own handler, or `Server` as a reverse proxy that injects `X-AIC-*` identity
+  headers.
 - **Evidence, not logs**: each decision can be emitted as a DSSE-wrapped CLC
   decision record, plus admission records for refusals that happen before the
   language layer and outcome records from the effect boundary.
 
+## Requirements
+
+| Requirement | Why |
+|---|---|
+| **Go 1.26 or newer** | the module declares `go 1.26`; no cgo |
+| `github.com/varwof/register v0.3.0` | the CLC evaluator and the decision-record format |
+| `github.com/varwof/types v0.6.0` | AIC / AIC-JWT structures |
+| `github.com/varwof/pkcs7 v0.1.0` | the semantics-layer detached signature check |
+| `github.com/mark3labs/mcp-go v1.0.0` | only if you import the `mcp` subpackage |
+
+They come in with `go get`; there are no local `replace` directives and nothing
+is vendored. The SDK itself needs no external service: CRL/OCSP responders and an
+RFC 3161 timestamp authority are optional and only used when you configure them.
+
+For the demo below you additionally need `curl` (any mTLS-capable client works)
+and three free local ports: **9444** (proxy), **9081** (demo backend it starts
+itself), and later **9443** (the evidence demo).
+
 ## Quick start (2 minutes)
 
-No certs, no config files — the example generates its own CA, server cert and an
-AIC-bearing client cert:
+Four steps, each one short. The demo generates its own CA and certificates, so
+there is nothing to configure first.
+
+**1. Get the code and generate demo certificates** — a CA plus a server
+certificate and an agent certificate that carries an AIC extension:
 
 ```bash
 git clone https://github.com/varwof/aic-verifier && cd aic-verifier
 go run ./examples/mtls-backend/gen-cert -out ./demo-certs
+```
+
+**2. Start the protected service** — it terminates mTLS on `:9444` and forwards
+admitted requests to a demo backend on `:9081` (started by the same process).
+Leave it running in this shell:
+
+```bash
 go run ./examples/mtls-backend --certs ./demo-certs
 ```
 
-In another shell, call the protected API **with the agent certificate**:
+**3. Call it as the agent** — in a second shell, present the agent certificate:
 
 ```bash
 curl -sS --cert demo-certs/client-cert.pem --key demo-certs/client-key.pem \
      --cacert demo-certs/ca-cert.pem https://localhost:9444/api
-# {"backend":"real-api-mtls","identity":{...}}
+# {"backend":"real-api-mtls","identity":{"X-Forwarded-For":"127.0.0.1, 127.0.0.1"}}
 ```
 
-Ask for something the agent is not allowed to do and the call is refused before
-it reaches the backend:
+**4. Watch a refusal** — ask for something the agent is not allowed to do; the
+request never reaches the backend:
 
 ```bash
 curl -sS --cert demo-certs/client-cert.pem --key demo-certs/client-key.pem \
@@ -58,8 +83,10 @@ curl -sS --cert demo-certs/client-cert.pem --key demo-certs/client-key.pem \
 # {"code":"access_denied","message":"agent missing required capabilities"}
 ```
 
-Step-by-step, including how to see the decision record and the refusal challenge:
-**[docs/quickstart.md](docs/quickstart.md)**.
+Stop the demo with `Ctrl-C` in the first shell. What the request left behind —
+the decision record, and how to recompute it — is
+**[docs/quickstart.md](docs/quickstart.md)**, which also covers calling the API
+without a client certificate and reading the record back.
 
 ## Use it in your own service
 
