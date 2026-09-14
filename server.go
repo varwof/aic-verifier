@@ -5,6 +5,7 @@ package aicverifier
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/varwof/register/semantics"
 )
 
 // Route is a reverse-proxy routing rule.
@@ -167,22 +170,22 @@ func (s *Server) Close(ctx context.Context) error {
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	route, ok := s.matchRoute(r.URL.Path)
 	if !ok {
-		s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusNotFound, Message: "no matching route"})
+		s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusNotFound, Stage: "route_denied", Message: "no matching route"})
 		return
 	}
 	if len(route.AllowMethods) > 0 && !contains(route.AllowMethods, r.Method) {
-		s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusMethodNotAllowed, Message: "method not allowed"})
+		s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusMethodNotAllowed, Stage: "method_not_allowed", Message: "method not allowed"})
 		return
 	}
 
 	ac := FromContext(r.Context())
 	if ac == nil {
-		s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "no verified identity"})
+		s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Stage: "identity_denied", Message: "no verified identity"})
 		return
 	}
 	if len(route.RequiredCapabilities) > 0 {
 		if !hasAllCapabilities(ac, route.RequiredCapabilities) {
-			s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "agent missing required capabilities"})
+			s.deny(w, r, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Stage: "capability_denied", Message: "agent missing required capabilities"})
 			return
 		}
 	}
@@ -213,21 +216,151 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Header.Set("X-Forwarded-For", host)
 	}
+	// The reverse proxy swallows transport errors into a 502; capture them so
+	// the outcome record can say "indeterminate" instead of pretending the
+	// backend answered 502.
+	backendErr := new(error)
+	rp.ErrorHandler = func(rw http.ResponseWriter, rr *http.Request, err error) {
+		*backendErr = err
+		http.Error(rw, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+	}
 	rec := &proxyStatusRecorder{ResponseWriter: w}
 	rp.ServeHTTP(rec, r)
+	s.emitProxyOutcome(r, ac, rec.status, *backendErr != nil)
 	if s.cfg.Hooks != nil && s.cfg.Hooks.Forwarded != nil {
 		s.cfg.Hooks.Forwarded(r, &http.Response{StatusCode: rec.status})
 	}
 }
 
-// deny runs the Denied hook (when configured) and writes the SDK error. The
-// Denied hook fires for route-level rejections that happen after admission; the
-// pipeline-level Denied hook is invoked by the middleware.
+// deny runs the Denied hook (when configured), leaves an evidence record for
+// this post-admission refusal, and writes the SDK error.  The Denied hook fires
+// for route-level rejections that happen after admission; the pipeline-level
+// Denied hook is invoked by the middleware.
 func (s *Server) deny(w http.ResponseWriter, r *http.Request, err *AuthError) {
+	err.Evidence = append(err.Evidence, s.denialEvidence(r, err)...)
 	if s.cfg.Hooks != nil && s.cfg.Hooks.Denied != nil {
 		s.cfg.Hooks.Denied(r, err)
 	}
-	writeSDKError(w, err.Status, err.Code.String(), err.Message)
+	writeAuthError(w, err, s.cfg)
+}
+
+// denialEvidence records a proxy-layer refusal — the reverse proxy refusing a
+// request after admission (no route, disallowed method, missing route
+// capability).  These refusals never reached the CLC layer, so like the
+// middleware's pre-language refusals they become honest AdmissionRecords, with
+// a stage naming the refusing layer (route_denied / method_not_allowed /
+// capability_denied).
+//
+// The single-refusal rule is respected: when the admission already produced
+// records for this request (AuthContext.Evidence), nothing is appended — the
+// request's outcome is already on record as a decision, and adding another
+// record would describe it twice in two payload types.
+func (s *Server) denialEvidence(r *http.Request, ae *AuthError) []RecordRef {
+	cfg := s.cfg.Evidence
+	if cfg == nil || ae == nil || len(ae.Evidence) > 0 {
+		return nil
+	}
+	if ac := FromContext(r.Context()); ac != nil && len(ac.Evidence) > 0 {
+		return nil
+	}
+	ctx := EvidenceContext{
+		RecorderID: cfg.RecorderID,
+		Outcome:    EvidenceRefused,
+		At:         cfg.now(),
+	}
+	if ac := FromContext(r.Context()); ac != nil {
+		ctx.Principal = ac.Principal
+		ctx.AgentID = ac.AgentID
+		ctx.Serial = ac.Serial
+	}
+	if r != nil {
+		ctx.Method = r.Method
+		ctx.Path = r.URL.Path
+		ctx.TraceID = r.Header.Get("X-Request-Id")
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			leaf := r.TLS.PeerCertificates[0]
+			if ctx.Serial == "" {
+				ctx.Serial = leaf.SerialNumber.Text(16)
+			}
+			sum := sha256.Sum256(leaf.Raw)
+			ctx.Facts = append(ctx.Facts, AdmissionFact{
+				Type:   "client-cert",
+				Digest: semantics.Digest{Alg: semantics.DigestAlgSHA256, Value: sum[:]},
+				Note:   "leaf certificate presented on this connection",
+			})
+		}
+	}
+	return recordRefusal(cfg, s.log, ctx, ae)
+}
+
+// emitProxyOutcome reports the effect the reverse proxy observed for an
+// admitted request when the deployment asked for outcome records
+// (EvidenceConfig.EmitOutcome).  A response from the backend is reported as
+// observed with its status; a transport failure is reported as indeterminate —
+// the SDK classifies neither as executed nor failed, that judgement is the
+// deployment's.  The decision digest points the outcome back at the admission
+// record it followed (empty when the admission produced no record: a gap, not
+// consent).
+func (s *Server) emitProxyOutcome(r *http.Request, ac *AuthContext, status int, transportErr bool) {
+	cfg := s.cfg.Evidence
+	if cfg == nil || !cfg.EmitOutcome || ac == nil {
+		return
+	}
+	outcome := OutcomeObserved
+	if transportErr {
+		outcome = OutcomeIndeterminate
+	}
+	decisionDigest := ""
+	if len(ac.Evidence) > 0 {
+		decisionDigest = ac.Evidence[0].Digest
+	}
+	at := cfg.now()
+	ctx := EvidenceContext{
+		RecorderID: cfg.RecorderID,
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		TraceID:    r.Header.Get("X-Request-Id"),
+		Principal:  ac.Principal,
+		AgentID:    ac.AgentID,
+		Serial:     ac.Serial,
+		Outcome:    EvidenceAdmitted,
+		At:         at,
+	}
+	rec := OutcomeRecord{
+		Outcome:        outcome,
+		At:             at,
+		DecisionDigest: decisionDigest,
+		OperationID:    r.Method + " " + r.URL.Path,
+		RecorderID:     cfg.RecorderID,
+		StatusCode:     status,
+		Identity:       AdmissionIdentity{Principal: ac.Principal, AgentID: ac.AgentID, Serial: ac.Serial},
+	}
+	sink := cfg.Sink
+	if sink == nil {
+		sink = SlogSink{Logger: s.log}
+	}
+	outSink, ok := sink.(OutcomeSink)
+	if !ok {
+		// A sink that does not know outcome records is an evidence gap for an
+		// EnitOutcome deployment — surfaced, never silent.
+		if cfg.OnError != nil {
+			cfg.gap()
+			cfg.OnError(ctx, fmt.Errorf("evidence: sink does not emit outcome records"))
+		}
+		return
+	}
+	if _, err := ReportOutcome(outSink, cfg, ctx, rec); err != nil {
+		cfg.gap()
+		if cfg.OnError != nil {
+			cfg.OnError(ctx, err)
+		} else {
+			logger := s.log
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Error("aic-verifier: outcome record failed", "error", err, "path", ctx.Path)
+		}
+	}
 }
 
 // proxyStatusRecorder captures the status code written to the backend response
@@ -320,10 +453,4 @@ func hasAllCapabilities(ac *AuthContext, need []string) bool {
 		}
 	}
 	return true
-}
-
-func writeSDKError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	fmt.Fprintf(w, `{"code":%q,"message":%q}`+"\n", code, message)
 }
