@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	aicverifier "github.com/varwof/aic-verifier"
 )
@@ -27,6 +28,10 @@ func main() {
 	opID := flag.String("op", "", "concrete operation to authorize (CLC); empty skips")
 	opParams := flag.String("op-params", "", "operation parameters as JSON")
 	requireAIC := flag.Bool("require-aic", true, "require the AIC extension (false also admits a human certificate whose PrincipalAuthorization covers the capability)")
+	evidenceDir := flag.String("evidence-dir", "", "write one DSSE/CLC decision-record envelope per decided operation into this directory (empty = emit nothing)")
+	evidenceTTL := flag.Duration("evidence-ttl", 5*time.Minute, "pin this RATS §10 freshness bound on each record (0 = no context)")
+	evidenceAudience := flag.String("evidence-audience", "", "audience the evidence is addressed to")
+	challenge := flag.Bool("challenge", false, "answer a refusable denial with 403 + application/problem+json carrying a CLC challenge")
 	flag.Parse()
 	if *caFile == "" || *certFile == "" || *keyFile == "" {
 		log.Fatal("--ca, --cert and --key are required")
@@ -42,6 +47,17 @@ func main() {
 	}
 	if *capability == "" {
 		conf.RequiredCapabilities = nil
+	}
+	if *evidenceDir != "" {
+		conf.Evidence = &aicverifier.EvidenceConfig{
+			Sink:       &aicverifier.FileSink{Dir: *evidenceDir, RecorderID: "smoke-verify"},
+			TTL:        *evidenceTTL,
+			Audience:   *evidenceAudience,
+			RecorderID: "smoke-verify",
+		}
+	}
+	if *challenge {
+		conf.Challenges = &aicverifier.ChallengeConfig{TTL: 5 * time.Minute, Audience: *evidenceAudience}
 	}
 	if *opID != "" {
 		op := aicverifier.Operation{ID: *opID}
