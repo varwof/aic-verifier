@@ -9,6 +9,8 @@ a minor.
 
 ## [Unreleased]
 
+## [v0.3.0-rc1] — 2026-09-23
+
 ### Added
 
 - **mTLS front end for the `mcp-behind-proxy` example.** A new `--mtls` mode
@@ -70,6 +72,18 @@ a minor.
 - `docs/api.md`, `docs/evidence.md`, `docs/comparison.md`, and the README
   updated to the nonce/linkage/orphan model.
 
+### Documentation
+
+- `docs/DESIGN.md` replaced by a `docs/` set — `index`, `architecture`
+  (a superset of the old design note), `comparison`, `deployment`, `examples`,
+  `reference`, `threat-model` — with `docs/evidence.md` and `docs/quickstart.md`
+  kept alongside it.
+- `README.md` and `README_CN.md` rewritten in step: a full feature table, a set
+  of minimal examples (middleware, proxy, in-process authorization, bearer,
+  `DecisionServer`, evidence + offline verification, challenge, supervision, MCP
+  gating), and a requirement-to-capability compliance mapping.
+- `CHANGELOG.md` (this file), `CONTRIBUTING.md` and `SECURITY.md` added.
+
 ### Dependencies
 
 - `github.com/varwof/register` and `github.com/varwof/types` moved to **v0.6.0**
@@ -122,6 +136,7 @@ a minor.
 - README with status, install, scope and related-repository sections; SPDX
   headers on example sources.
 
-[Unreleased]: https://github.com/varwof/aic-verifier/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/varwof/aic-verifier/compare/v0.3.0-rc1...HEAD
+[v0.3.0-rc1]: https://github.com/varwof/aic-verifier/compare/v0.2.0...v0.3.0-rc1
 [v0.2.0]: https://github.com/varwof/aic-verifier/releases/tag/v0.2.0
 [v0.1.0]: https://github.com/varwof/aic-verifier/releases/tag/v0.1.0
