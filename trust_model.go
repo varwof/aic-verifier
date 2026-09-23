@@ -89,7 +89,7 @@ func VerifyLayer1(chain []*x509.Certificate, cfg *PipelineConfig) *Layer1Result 
 			return &Layer1Result{Reason: err.Error()}
 		}
 	}
-	roles := ExtractPolicyRoles(chain[0])
+	roles := extractPolicyRoles(chain[0], cfg.AuthorizationPolicy)
 	if len(cfg.AllowRoles) > 0 {
 		if !CheckRole(roles, cfg.AllowRoles) {
 			return &Layer1Result{

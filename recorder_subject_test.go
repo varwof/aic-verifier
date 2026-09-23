@@ -85,7 +85,7 @@ func TestEmittedRecordsCarryRecorderSubject(t *testing.T) {
 	// 2) 管线级拒绝记录
 	a := &authenticator{cfg: &Config{Evidence: cfg}}
 	req := requestWithCert(t, cert)
-	rrefs := a.refusalEvidence(req, &AuthError{Code: ErrDenied, Status: 403, Message: "denied"})
+	rrefs := a.refusalEvidence(viewFromHTTP(nil, req), &AuthError{Code: ErrDenied, Status: 403, Message: "denied"})
 	if len(rrefs) != 1 {
 		t.Fatalf("admission refs = %v", rrefs)
 	}

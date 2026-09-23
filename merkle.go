@@ -4,6 +4,7 @@
 package aicverifier
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -116,7 +117,7 @@ func VerifyProof(leaf []byte, proof []ProofStep, root []byte) bool {
 			hash = HashNode(hash, step.Sibling)
 		}
 	}
-	return len(hash) > 0 && len(root) > 0 && string(hash) == string(root)
+	return len(hash) > 0 && len(root) > 0 && bytes.Equal(hash, root)
 }
 
 // VerifyProofBounded is like VerifyProof but enforces a maximum proof length

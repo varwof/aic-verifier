@@ -89,7 +89,7 @@ func NewHandler(sc ServerConfig, reg *Registry, handlers map[string]ToolHandler)
 		sc.ServerName = "aic-verifier-mcp"
 	}
 	if sc.ServerVersion == "" {
-		sc.ServerVersion = "0.1.0"
+		sc.ServerVersion = aicverifier.Version
 	}
 	logger := sc.Logger
 	if logger == nil {
@@ -161,9 +161,19 @@ func (e *enforcement) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ac != nil {
 		r = r.WithContext(context.WithValue(r.Context(), mcpAuthKey{}, ac))
 	}
-	body, err := io.ReadAll(r.Body)
+	// H1: bound the read so an attacker cannot force an unbounded buffering of
+	// the request body. LimitReader returns exactly limit bytes when the body
+	// is larger, which we treat as too large.
+	// H1: bound the read so an attacker cannot force an unbounded buffering of
+	// the request body. LimitReader returns exactly limit bytes when the body
+	// is larger, which we treat as too large.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	if len(body) >= 8<<20 {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))

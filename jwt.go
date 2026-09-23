@@ -339,30 +339,38 @@ func parsePEMCerts(pemData []byte) ([]*x509.Certificate, error) {
 // single-use: CheckAndAdd records the nonce the first time and rejects any
 // later reuse.
 type memReplayStore struct {
-	mu    sync.Mutex
-	seen  map[string]time.Time
-	ttl   time.Duration
-	max   int
-	start time.Time
+	mu   sync.Mutex
+	seen map[string]time.Time
+	ttl  time.Duration
+	max  int
 }
 
 // NewReplayNonceStore returns a process-local replay-protection store.
 // Nonces are retained for ttl (default 24h) and at most max entries (default
-// 4096); beyond that the oldest are evicted. The store is intended for
-// single-node gateways; multi-node deployments should share a distributed
-// nonce store instead.
+// 65536). The store is intended for single-node gateways; multi-node
+// deployments should share a distributed nonce store instead.
+//
+// Capacity (P1-1): entries older than ttl (their token's replay window has
+// lapsed) are purged lazily; a live marker younger than max token-lifetime is
+// NEVER evicted, because eviction removes the one-time-use marker and lets the
+// captured token become replayable again before it expires. When capacity is
+// exhausted with only live markers remaining, CheckAndAdd fails closed and
+// refuses to record the new nonce (the present request is denied) rather than
+// trade replay protection for availability. The default of 65536 entries is
+// sized far beyond the legitimate nonce rate of a single gateway, so the
+// fail-closed path only triggers under pathological load or misuse; prefer a
+// distributed store if capacity pressure is ever observed.
 func NewReplayNonceStore(ttl time.Duration, max int) *memReplayStore {
 	if ttl <= 0 {
 		ttl = 24 * time.Hour
 	}
 	if max <= 0 {
-		max = 4096
+		max = 65536
 	}
 	return &memReplayStore{
-		seen:  make(map[string]time.Time),
-		ttl:   ttl,
-		max:   max,
-		start: time.Now(),
+		seen: make(map[string]time.Time),
+		ttl:  ttl,
+		max:  max,
 	}
 }
 
@@ -374,37 +382,33 @@ func (s *memReplayStore) CheckAndAdd(nonce string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if ts, ok := s.seen[nonce]; ok {
 		return fmt.Errorf("replay store: nonce replayed (first used %s)", ts.Format(time.RFC3339))
 	}
-	s.seen[nonce] = time.Now()
-	// Bounded memory: evict expired entries, then trim oldest if over cap.
+	now := time.Now()
+	s.seen[nonce] = now
+
+	// Bounded storage (P1-1): the one-time-use nonce store is capped so an
+	// attacker cannot grow memory without bound by minting markers.  TTL bounds
+	// completeness; capacity bounds memory.  When the cap is exceeded only
+	// markers whose TTL has already lapsed (the token they protect is expired,
+	// so their replay window is closed) are purged — the OLDEST live markers are
+	// never evicted, because evicting a live marker would re-arm the captured
+	// token for replay until its own expiry.  If capacity is exhausted with only
+	// live markers remaining, the store fails closed: it refuses to record the
+	// new nonce (denying the present request) instead of silently dropping a
+	// protection marker.
 	if len(s.seen) > s.max {
-		cutoff := time.Now().Add(-s.ttl)
+		cutoff := now.Add(-s.ttl)
 		for k, ts := range s.seen {
 			if ts.Before(cutoff) {
 				delete(s.seen, k)
 			}
 		}
 		if len(s.seen) > s.max {
-			oldest := s.start
-			for _, ts := range s.seen {
-				if ts.Before(oldest) {
-					oldest = ts
-				}
-			}
-			// O(n) trim: drop everything at/before the cap watermark.
-			toDelete := len(s.seen) - s.max
-			deleted := 0
-			for k, ts := range s.seen {
-				if deleted >= toDelete {
-					break
-				}
-				if !ts.After(oldest) {
-					delete(s.seen, k)
-					deleted++
-				}
-			}
+			delete(s.seen, nonce)
+			return fmt.Errorf("replay store: nonce store at capacity %d with only live markers; refusing to record (fail-closed, P1-1)", s.max)
 		}
 	}
 	return nil

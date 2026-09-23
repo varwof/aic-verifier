@@ -247,7 +247,7 @@ func (e *FileEvidenceExporter) Export(ctx context.Context, q EvidenceQuery) (*Ev
 	}
 	gen := e.Generator
 	if gen == "" {
-		gen = "aic-verifier v0.1.0"
+		gen = "aic-verifier v" + Version
 	}
 
 	entries, err := readAuditChainLines(e.AuditFile, q)

@@ -439,6 +439,13 @@ func TestEvidenceRefusalMapsRetryBoundToHeaderAndBody(t *testing.T) {
 	if retry.NotBefore.Before(lo) || retry.NotBefore.After(hi) {
 		t.Errorf("NotBefore = %s, want now+30s (±2s)", retry.NotBefore.Format(time.RFC3339))
 	}
+
+	// 无 RequiredOperations 时，action_digest 必须绑定具体请求而非常量：
+	// doMTLSEvidenceTest 发 GET /，挑战摘要应等于 "GET /" 的摘要。
+	wantDigest := semantics.DigestOfCanonical([]byte("GET /"))
+	if got := captured.Problem.Challenge.ActionDigest; got.Alg != wantDigest.Alg || !bytes.Equal(got.Value, wantDigest.Value) {
+		t.Errorf("action_digest = %+v, want the request-bound digest for %q", got, "GET /")
+	}
 }
 func findRecordFile(t *testing.T, dir string, admission bool) (string, error) {
 	t.Helper()

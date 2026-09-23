@@ -156,6 +156,18 @@ func ParseConfig(data []byte) (*Config, error) {
 	c.AuditTSAURL = fc.AuditTSAURL
 	c.SupervisionLogFile = fc.SupervisionLogFile
 
+	// M3: wire the configured supervision log file into a SupervisionStore so
+	// supervision_log_file actually takes effect instead of being silently
+	// ignored. Empty path stays unwired (no persistence), mirroring how the
+	// audit logger treats an empty AuditLogFile.
+	if c.SupervisionLogFile != "" {
+		st, err := NewSupervisionStore(c.SupervisionLogFile, nil, 64<<20, 3)
+		if err != nil {
+			return nil, fmt.Errorf("aic-verifier: supervision store: %w", err)
+		}
+		c.SupervisionStore = st
+	}
+
 	if fc.Server.ReadTimeout != "" || fc.Server.ReadHeaderTimeout != "" ||
 		fc.Server.WriteTimeout != "" || fc.Server.IdleTimeout != "" ||
 		fc.Server.MaxHeaderBytes != 0 {

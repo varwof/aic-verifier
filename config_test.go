@@ -4,6 +4,7 @@
 package aicverifier
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"testing"
@@ -86,7 +87,10 @@ func TestParseConfigBadAuthMode(t *testing.T) {
 }
 
 func TestParseConfigSupervisionPolicy(t *testing.T) {
-	c, err := ParseConfig([]byte(`{
+	// The supervision_log_file is wired into a SupervisionStore at parse time
+	// (M3), so the test points it at a writable temp path instead of /var/log.
+	supFile := t.TempDir() + "/supervision.jsonl"
+	c, err := ParseConfig([]byte(fmt.Sprintf(`{
 		"supervision_policy": {
 			"require_runtime_approval": true,
 			"allow_break_glass": true,
@@ -94,8 +98,8 @@ func TestParseConfigSupervisionPolicy(t *testing.T) {
 		},
 		"audit_log_file": "/var/log/audit.jsonl",
 		"audit_tsa_url": "https://tsa.example.com/rfc3161",
-		"supervision_log_file": "/var/log/supervision.jsonl"
-	}`))
+		"supervision_log_file": %q
+	}`, supFile)))
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
 	}
@@ -110,8 +114,15 @@ func TestParseConfigSupervisionPolicy(t *testing.T) {
 	if c.AuditTSAURL != "https://tsa.example.com/rfc3161" {
 		t.Errorf("AuditTSAURL = %q", c.AuditTSAURL)
 	}
-	if c.SupervisionLogFile != "/var/log/supervision.jsonl" {
+	if c.SupervisionLogFile != supFile {
 		t.Errorf("SupervisionLogFile = %q", c.SupervisionLogFile)
+	}
+	// M3: the parsed supervision log file must have produced a working store.
+	if c.SupervisionStore == nil {
+		t.Fatal("SupervisionStore = nil, want store wired from supervision_log_file")
+	}
+	if c.SupervisionStore.File() != supFile {
+		t.Errorf("SupervisionStore.File() = %q, want %q", c.SupervisionStore.File(), supFile)
 	}
 }
 

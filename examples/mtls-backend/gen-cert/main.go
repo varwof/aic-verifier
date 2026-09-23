@@ -18,7 +18,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -29,27 +29,48 @@ import (
 )
 
 func main() {
-	out := flag.String("out", "dev-certs", "output directory")
-	flag.Parse()
-
-	if err := os.MkdirAll(*out, 0o755); err != nil {
-		log.Fatal(err)
-	}
-
-	caKey, caCert := makeCA(*out)
-	serverCert := makeServer(*out, caKey, caCert)
-	clientCert := makeClient(*out, caKey, caCert)
-
-	fmt.Printf("generated in %s:\n", *out)
-	fmt.Printf("  ca-cert.pem  ca-key.pem\n  server-cert.pem  server-key.pem\n")
-	fmt.Printf("  client-cert.pem  client-key.pem  (mTLS + AIC)\n")
-	_, _ = serverCert, clientCert
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func makeCA(dir string) (*ecdsa.PrivateKey, *x509.Certificate) {
+// run implements the command so every failure path is coverable without
+// exiting the test process. Exit codes: 1 generation failed, 2 flag error.
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("gen-cert", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	out := fs.String("out", "dev-certs", "output directory")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	if err := os.MkdirAll(*out, 0o755); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	caKey, caCert, err := makeCA(*out)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if _, err := makeServer(*out, caKey, caCert); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if _, err := makeClient(*out, caKey, caCert); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "generated in %s:\n", *out)
+	fmt.Fprintf(stdout, "  ca-cert.pem  ca-key.pem\n  server-cert.pem  server-key.pem\n")
+	fmt.Fprintf(stdout, "  client-cert.pem  client-key.pem  (mTLS + AIC)\n")
+	return 0
+}
+
+func makeCA(dir string) (*ecdsa.PrivateKey, *x509.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		log.Fatal(err)
+		return nil, nil, err
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -62,21 +83,25 @@ func makeCA(dir string) (*ecdsa.PrivateKey, *x509.Certificate) {
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
-		log.Fatal(err)
+		return nil, nil, err
 	}
-	writeCert(filepath.Join(dir, "ca-cert.pem"), der)
-	writeKey(filepath.Join(dir, "ca-key.pem"), key)
+	if err := writeCert(filepath.Join(dir, "ca-cert.pem"), der); err != nil {
+		return nil, nil, err
+	}
+	if err := writeKey(filepath.Join(dir, "ca-key.pem"), key); err != nil {
+		return nil, nil, err
+	}
 	cert, err := x509.ParseCertificate(der)
 	if err != nil {
-		log.Fatal(err)
+		return nil, nil, err
 	}
-	return key, cert
+	return key, cert, nil
 }
 
-func makeServer(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) *x509.Certificate {
+func makeServer(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) (*x509.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
@@ -90,18 +115,21 @@ func makeServer(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) *x509
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	writeCert(filepath.Join(dir, "server-cert.pem"), der)
-	writeKey(filepath.Join(dir, "server-key.pem"), key)
-	cert, _ := x509.ParseCertificate(der)
-	return cert
+	if err := writeCert(filepath.Join(dir, "server-cert.pem"), der); err != nil {
+		return nil, err
+	}
+	if err := writeKey(filepath.Join(dir, "server-key.pem"), key); err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(der)
 }
 
-func makeClient(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) *x509.Certificate {
+func makeClient(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) (*x509.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
 	aic := pki.AIC{
@@ -126,7 +154,7 @@ func makeClient(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) *x509
 	}
 	aicDER, err := asn1.Marshal(aic)
 	if err != nil {
-		log.Fatal("asn1.Marshal AIC:", err)
+		return nil, fmt.Errorf("asn1.Marshal AIC: %w", err)
 	}
 
 	tmpl := &x509.Certificate{
@@ -142,36 +170,35 @@ func makeClient(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) *x509
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
 	if err != nil {
-		log.Fatal("CreateCertificate:", err)
+		return nil, fmt.Errorf("CreateCertificate: %w", err)
 	}
-	writeCert(filepath.Join(dir, "client-cert.pem"), der)
-	writeKey(filepath.Join(dir, "client-key.pem"), key)
-	cert, _ := x509.ParseCertificate(der)
-	return cert
+	if err := writeCert(filepath.Join(dir, "client-cert.pem"), der); err != nil {
+		return nil, err
+	}
+	if err := writeKey(filepath.Join(dir, "client-key.pem"), key); err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(der)
 }
 
-func writeCert(path string, der []byte) {
+func writeCert(path string, der []byte) error {
 	f, err := os.Create(path)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer f.Close()
-	if err := pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-		log.Fatal(err)
-	}
+	return pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-func writeKey(path string, key *ecdsa.PrivateKey) {
+func writeKey(path string, key *ecdsa.PrivateKey) error {
 	der, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	f, err := os.Create(path)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer f.Close()
-	if err := pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}); err != nil {
-		log.Fatal(err)
-	}
+	return pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
 }

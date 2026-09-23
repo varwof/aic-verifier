@@ -15,7 +15,7 @@ cfg := &aicverifier.Config{
     // ...the usual admission configuration...
     Evidence: &aicverifier.EvidenceConfig{
         Sink:       &aicverifier.FileSink{Dir: "/var/lib/aic/evidence", RecorderID: "pep-1"},
-        TTL:        5 * time.Minute,               // RATS §10 explicit clock on the record
+        TTL:        5 * time.Minute,               // RATS §10.1 explicit clock; every record also carries a per-admission nonce (§10.2)
         Audience:   "https://gateway-a.example",
         RecorderID: "pep-1",
         // Strict: true,                           // fail closed if the sink is down
@@ -214,6 +214,29 @@ outcome, err := aicverifier.ReportOutcome(sink, evCfg, ctx, aicverifier.OutcomeR
   logs.  An empty linkage is a gap for the consumer to notice, never consent.
 - `FileSink` writes it as `<recorder>-outcome-<digest>.json`;
   `CheckEvidenceEnvelope` recognises all three payloads.
+
+**Reporting is on the request path.**  With `EmitOutcome: true` the middleware
+reports an outcome after the downstream handler returns (observed + status) and
+the built-in reverse proxy reports after the backend answers (observed + status,
+or `indeterminate` on a transport failure — never a forged 502).  Because
+`NewServer` composes the proxy *through* the middleware, the middleware defers
+to the proxy's own report (a transport failure must stay `indeterminate`, not be
+reclassified as observed by the outer recorder).  `NewAdmissionRecord` and the
+CLC path are untouched.
+
+**One authentic record per execution instance.**  Every decision record carries
+an unpredictable per-admission nonce bound into its `DecisionContext` (RATS
+§10.2), so its input digest names that exact admission — two identical requests
+are two distinct records, and an outcome can only point at the admission it
+followed, never at "whichever identical decision was recorded first".  `TTL`
+still pins the explicit clock alongside it when configured (§10.1).
+
+**Linkage is verified, not assumed.**  `VerifyEvidenceDir` collects the decision
+digests found in a directory, then checks that every outcome's `decisionDigest`
+resolves to one of them.  An outcome that is empty, or points at a decision that
+is not present, is reported as an orphan (`OrphanOutcome`) and listed in
+`Failures` — a gap as visible as a record that fails to verify, and never a
+consent count.
 
 ### One decision, two views
 

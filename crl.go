@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -53,10 +54,18 @@ func NewCRLCache(caCert *x509.Certificate, url string, refreshSec int, translato
 	if d <= 0 {
 		d = 5 * time.Minute
 	}
+	// H3: bound the connection phases so a hung CRL distribution point cannot
+	// pin gateway goroutines forever: 5s dial + 5s TLS handshake, plus the
+	// client-level 30s total timeout below.
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 5 * time.Second,
 	}
 	return &CRLCache{
 		caCert:     caCert,

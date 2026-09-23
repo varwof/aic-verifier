@@ -232,7 +232,12 @@ func (p *AuthorizationPolicy) HasParamDefault(scheme, capID, param string) (any,
 // Returned role names include both policy role names and original gateway:* OUs (if present),
 // for compatibility with both configuration styles.
 func ExtractPolicyRoles(cert *x509.Certificate) []string {
-	policy := GetAuthorizationPolicy()
+	return extractPolicyRoles(cert, GetAuthorizationPolicy())
+}
+
+// extractPolicyRoles is the registry-parameterized form of ExtractPolicyRoles: it may be fed
+// a per-Config AuthorizationPolicy (per-Config prioritized, global dropped when non-nil).
+func extractPolicyRoles(cert *x509.Certificate, policy *AuthorizationPolicy) []string {
 	roles := ExtractRoles(cert)
 	if policy == nil {
 		return roles

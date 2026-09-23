@@ -35,7 +35,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -58,31 +58,98 @@ const (
 )
 
 func main() {
-	addr := flag.String("addr", defaultAddr, "HTTP listen address")
-	toolsFile := flag.String("tools", defaultManifest, "tool manifest (tools.json)")
-	jwtCA := flag.String("jwt-ca", defaultCA, "PEM CA(s) trusted for Bearer AIC-JWT (kid = CA SPKI hash)")
-	issuer := flag.String("issuer", defaultIssuer, "required AIC-JWT iss claim")
-	audience := flag.String("audience", defaultAudience, "required AIC-JWT aud claim")
-	auditFile := flag.String("audit-file", "audit-mcp.jsonl", "aic-verifier audit JSON Lines file")
-	tlsCertFile := flag.String("tls-cert", "server-cert.pem", "TLS server certificate (self-signed when missing)")
-	tlsKeyFile := flag.String("tls-key", "server-key.pem", "TLS server key (self-signed when missing)")
-	noMint := flag.Bool("no-mint", false, "do not mint demo tokens (full-chain mode): a token issued by user-signer+issuer must be presented")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
 
-	// 1. Tool manifest (unguessable surface + per-tool barriers).
-	manifest, err := os.ReadFile(*toolsFile)
+// mcpStack is everything run() needs to serve: the AIC-gated MCP handler, the
+// demo tokens printed for the operator, and the audit logger to flush on exit.
+type mcpStack struct {
+	handler  http.Handler
+	opToken  string
+	audToken string
+	audit    *aicverifier.AuditLogger
+}
+
+func (s *mcpStack) close() error {
+	if s == nil || s.audit == nil {
+		return nil
+	}
+	return s.audit.Close()
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mcp-server", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addr := fs.String("addr", defaultAddr, "HTTP listen address")
+	toolsFile := fs.String("tools", defaultManifest, "tool manifest (tools.json)")
+	jwtCA := fs.String("jwt-ca", defaultCA, "PEM CA(s) trusted for Bearer AIC-JWT (kid = CA SPKI hash)")
+	issuer := fs.String("issuer", defaultIssuer, "required AIC-JWT iss claim")
+	audience := fs.String("audience", defaultAudience, "required AIC-JWT aud claim")
+	auditFile := fs.String("audit-file", "audit-mcp.jsonl", "aic-verifier audit JSON Lines file")
+	tlsCertFile := fs.String("tls-cert", "server-cert.pem", "TLS server certificate (self-signed when missing)")
+	tlsKeyFile := fs.String("tls-key", "server-key.pem", "TLS server key (self-signed when missing)")
+	noMint := fs.Bool("no-mint", false, "do not mint demo tokens (full-chain mode): a token issued by user-signer+issuer must be presented")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	stack, err := buildStack(*toolsFile, *jwtCA, *issuer, *audience, *auditFile, *noMint)
 	if err != nil {
-		log.Fatalf("mcp-server: read %s: %v", *toolsFile, err)
+		fmt.Fprintf(stderr, "mcp-server: %v\n", err)
+		return 1
+	}
+	defer stack.close()
+
+	if !*noMint {
+		fmt.Fprintf(stderr, "OPERATOR TOKEN (mcp:db_query + mcp:trade_exec):\n%s\n\n", stack.opToken)
+		fmt.Fprintf(stderr, "AUDITOR TOKEN (mcp:db_query only):\n%s\n\n", stack.audToken)
+	} else {
+		fmt.Fprintf(stderr, "Full-chain mode: present a token minted by user-signer+issuer;\n"+
+			"trust root = %s. The token must carry the mcp:* capabilities it wants to call.\n", *jwtCA)
+	}
+
+	// TLS terminator. Bearer AIC-JWT transport safety forbids bearer tokens
+	// over plaintext, so the examples terminates TLS with a self-signed cert
+	// (mTLS / real PKI is configured through the same fields in production).
+	if err := ensureServerTLS(*tlsCertFile, *tlsKeyFile); err != nil {
+		fmt.Fprintf(stderr, "mcp-server: tls: %v\n", err)
+		return 1
+	}
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: stack.handler,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+
+	fmt.Fprintf(stderr, "AIC-gated MCP server listening on %s (manifest %s, audit %s)\n", *addr, *toolsFile, *auditFile)
+	if err := srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintf(stderr, "mcp-server: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// buildStack assembles the fail-closed MCP stack: tool manifest, audit sink,
+// embedded MCP handler, optional demo-token minting and the aic-verifier
+// admission wrapper. run() serves the returned handler; tests mount it on
+// httptest.
+func buildStack(toolsFile, jwtCA, issuer, audience, auditFile string, noMint bool) (*mcpStack, error) {
+	// 1. Tool manifest (unguessable surface + per-tool barriers).
+	manifest, err := os.ReadFile(toolsFile)
+	if err != nil {
+		return nil, err
 	}
 	reg, err := aicmcp.LoadJSON(manifest)
 	if err != nil {
-		log.Fatalf("mcp-server: tools.json: %v", err)
+		return nil, fmt.Errorf("tools.json: %w", err)
 	}
 
 	// 2. Audit sink (nil file disables entries).
-	audit, err := aicverifier.NewAuditLogger(*auditFile, nil, 64<<20, 5)
+	audit, err := aicverifier.NewAuditLogger(auditFile, nil, 64<<20, 5)
 	if err != nil {
-		log.Fatalf("mcp-server: audit: %v", err)
+		return nil, fmt.Errorf("audit: %w", err)
 	}
 
 	// 3. MCP handler: embedded mcp-go Streamable HTTP server (pinned to
@@ -93,7 +160,7 @@ func main() {
 		Audit:         audit,
 	}, reg, exampleTools())
 	if err != nil {
-		log.Fatalf("mcp-server: %v", err)
+		return nil, err
 	}
 
 	// 4. Default mode: mint the two demo identities before the admission
@@ -101,11 +168,11 @@ func main() {
 	// issuer CA must already exist and the token is minted externally by the
 	// user-signer + issuer pipeline.
 	opToken, audToken := "", ""
-	if !*noMint {
+	if !noMint {
 		var err error
-		opToken, audToken, err = mintLocalTokens(*issuer, *audience)
+		opToken, audToken, err = mintLocalTokens(issuer, audience)
 		if err != nil {
-			log.Fatalf("mcp-server: mint: %v", err)
+			return nil, err
 		}
 	}
 
@@ -113,9 +180,9 @@ func main() {
 	// the Denied hook (admission-level audits live next to the mcp_* decision
 	// audits in the same file).
 	conf := &aicverifier.Config{
-		JWTCAFile:   *jwtCA,
-		JWTIssuer:   *issuer,
-		JWTAudience: []string{*audience},
+		JWTCAFile:   jwtCA,
+		JWTIssuer:   issuer,
+		JWTAudience: []string{audience},
 		AuthMode:    aicverifier.BearerOnly,
 		RequireAIC:  true,
 		// ReplayProtection is disabled because one MCP client session marshals
@@ -137,35 +204,9 @@ func main() {
 	}
 	admitted, err := conf.Handler(mcpHandler)
 	if err != nil {
-		log.Fatalf("mcp-server: admission: %v", err)
+		return nil, fmt.Errorf("admission: %w", err)
 	}
-
-	if !*noMint {
-		fmt.Fprintf(os.Stderr, "OPERATOR TOKEN (mcp:db_query + mcp:trade_exec):\n%s\n\n", opToken)
-		fmt.Fprintf(os.Stderr, "AUDITOR TOKEN (mcp:db_query only):\n%s\n\n", audToken)
-	} else {
-		fmt.Fprintf(os.Stderr, "Full-chain mode: present a token minted by user-signer+issuer;\n"+
-			"trust root = %s. The token must carry the mcp:* capabilities it wants to call.\n", *jwtCA)
-	}
-
-	// TLS terminator. Bearer AIC-JWT transport safety forbids bearer tokens
-	// over plaintext, so the examples terminates TLS with a self-signed cert
-	// (mTLS / real PKI is configured through the same fields in production).
-	if err := ensureServerTLS(*tlsCertFile, *tlsKeyFile); err != nil {
-		log.Fatalf("mcp-server: tls: %v", err)
-	}
-	srv := &http.Server{
-		Addr:    *addr,
-		Handler: admitted,
-		TLSConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		},
-	}
-
-	log.Printf("AIC-gated MCP server listening on %s (manifest %s, audit %s)", *addr, *toolsFile, *auditFile)
-	if err := srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
-	}
+	return &mcpStack{handler: admitted, opToken: opToken, audToken: audToken, audit: audit}, nil
 }
 
 // mintLocalTokens creates (or reuses) the demo CA and signs the operator and

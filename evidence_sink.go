@@ -23,6 +23,7 @@
 package aicverifier
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -32,6 +33,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,8 +101,10 @@ type EvidenceConfig struct {
 	// broken sink should not silently take a service down — a deployment that
 	// needs the record more than the request sets this true.
 	Strict bool
-	// TTL, when non-zero, pins a RATS §10 explicit-clock freshness input on the
-	// record (At=now, MaxAgeSec=TTL).  Zero records no freshness context.
+	// TTL, when non-zero, pins a RATS §10.1 explicit-clock freshness input on the
+	// record (At=now, MaxAgeSec=TTL) in addition to the per-admission nonce that
+	// every record carries (RATS §10.2).  Zero pins no clock: the record's context
+	// then identifies the admission instance by nonce alone.
 	TTL time.Duration
 	// Audience names the relying party the evidence is addressed to.
 	Audience string
@@ -128,11 +132,13 @@ type EvidenceConfig struct {
 	// the request.
 	Sign  func(pae []byte) ([]byte, error)
 	KeyID string
-	// EmitOutcome, when true, makes the reverse proxy report an outcome record
-	// after every forwarded request (a response → observed + status; a
-	// transport failure → indeterminate).  It is an opt-in effect-side channel:
-	// classification of executed/failed stays with the deployment.  The
-	// decision, admission and standing evidence budget are unaffected.
+	// EmitOutcome, when true, makes the request path report an outcome record
+	// after every admitted request: the reverse proxy observes the backend
+	// (a response → observed + status; a transport failure → indeterminate) and
+	// the middleware observes the downstream handler (a returned handler →
+	// observed + status).  It is an opt-in effect-side channel: classification
+	// of executed/failed stays with the deployment.  The decision, admission
+	// and standing evidence budget are unaffected.
 	EmitOutcome bool
 	// Requirement, when set, is bound into each record as its requirement
 	// digest: a record then says *which* sufficiency bar was applied, not just
@@ -166,6 +172,21 @@ func (c *EvidenceConfig) gap() {
 	if c != nil && c.Gaps != nil {
 		c.Gaps.Inc()
 	}
+}
+
+// newEvidenceNonce mints the per-admission instance identifier that is bound
+// into every decision record's context (RATS §10.2 implicit timekeeping).  It
+// makes a record's input digest identify one *execution instance*, so an
+// outcome record can only ever point back at the exact admission it followed.
+// crypto/rand supplies the unpredictable value; the fallback is a monotonic
+// timestamp whose collision odds are negligible but must never silently read
+// as entropy (hence the distinct prefix).
+func newEvidenceNonce() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err == nil {
+		return hex.EncodeToString(b)
+	}
+	return "nonce-" + strconv.FormatInt(time.Now().UnixNano(), 16)
 }
 
 // GapCounter is an atomically counted evidence-gap meter: how often an emission
@@ -426,13 +447,21 @@ func EmitDecisionRecords(cfg *EvidenceConfig, sinkCtx EvidenceContext, cert *x50
 		sources = chain
 	}
 
-	var opts semantics.RecordOptions
+	// Every admission gets its own unpredictable nonce bound into the decision
+	// context, whether or not a clock is pinned: the record digest is then
+	// unique per admission *instance*, not per (grant, operation) tuple.  This
+	// is what makes an outcome's decisionDigest point at exactly one execution
+	// instead of "whichever identical decision happened to be recorded first" —
+	// a TTL of zero must not collapse two identical requests into one
+	// undistinguishable digest.  The TTL pin stays what it always was: explicit
+	// timekeeping when configured, and only implicit (nonce) timekeeping when
+	// not (RATS §10.2).
+	instanceCtx := semantics.DecisionContext{Nonce: newEvidenceNonce()}
 	if cfg.TTL > 0 {
-		ctx := semantics.DecisionContext{At: cfg.now(), MaxAgeSec: int64(cfg.TTL.Seconds())}
-		opts.Context = &ctx
+		instanceCtx.At = cfg.now()
+		instanceCtx.MaxAgeSec = int64(cfg.TTL.Seconds())
 	}
-	opts.Sources = sources
-	opts.Requirement = cfg.Requirement
+	opts := semantics.RecordOptions{Context: &instanceCtx, Sources: sources, Requirement: cfg.Requirement}
 
 	base := sinkCtx
 	if base.At.IsZero() {

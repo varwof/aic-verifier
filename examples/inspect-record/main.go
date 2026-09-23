@@ -17,40 +17,46 @@ package main
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 
 	aicverifier "github.com/varwof/aic-verifier"
 )
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: inspect-record <record.json>")
-		os.Exit(2)
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "usage: inspect-record <record.json>")
+		return 2
 	}
 
-	rec, err := aicverifier.LoadEvidenceRecord(os.Args[1])
+	rec, err := aicverifier.LoadEvidenceRecord(args[0])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "inspect-record:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "inspect-record:", err)
+		return 1
 	}
 
-	fmt.Printf("language   %s (%s)\n", rec.Lang, rec.Ver)
+	fmt.Fprintf(stdout, "language   %s (%s)\n", rec.Lang, rec.Ver)
 	for _, op := range rec.Inputs.Operations {
-		fmt.Printf("operation  %s\n", op.ID)
+		fmt.Fprintf(stdout, "operation  %s\n", op.ID)
 	}
-	fmt.Printf("verdict    %s\n", rec.Verdict)
+	fmt.Fprintf(stdout, "verdict    %s\n", rec.Verdict)
 	if rec.Reason != "" {
-		fmt.Printf("reason     %s\n", rec.Reason)
+		fmt.Fprintf(stdout, "reason     %s\n", rec.Reason)
 	}
 	for _, obligation := range rec.Constraints.Unresolved {
-		fmt.Printf("unresolved %s\n", obligation)
+		fmt.Fprintf(stdout, "unresolved %s\n", obligation)
 	}
-	fmt.Printf("inputs     %s:%s\n", rec.InputDigest.Alg,
+	fmt.Fprintf(stdout, "inputs     %s:%s\n", rec.InputDigest.Alg,
 		base64.RawURLEncoding.EncodeToString(rec.InputDigest.Value))
 
 	// Re-running the language is what makes the file evidence: the digest above
 	// is over the inputs, and the verdict is derived from them, never trusted.
 	if decision, err := rec.Recompute(); err == nil {
-		fmt.Printf("recomputed %s\n", decision.Verdict)
+		fmt.Fprintf(stdout, "recomputed %s\n", decision.Verdict)
 	}
+	return 0
 }

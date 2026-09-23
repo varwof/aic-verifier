@@ -40,7 +40,7 @@ func TestCheckEvidenceRequirementSatisfied(t *testing.T) {
 		},
 	}}
 	ac := &AuthContext{}
-	if err := a.checkEvidenceRequirement(nil, ac, &PipelineResult{}); err != nil {
+	if err := a.checkEvidenceRequirement(&RequestView{}, ac, &PipelineResult{}); err != nil {
 		t.Fatalf("satisfied requirement must admit: %v", err)
 	}
 	if ac.Satisfaction == nil || !ac.Satisfaction.Satisfied() {
@@ -62,11 +62,11 @@ func TestCheckEvidenceRequirementRefusesWithChallenge(t *testing.T) {
 			NewID: func() string { return "ch_evidence" }, NewNonce: func() string { return "nonce-0123456789" }},
 	}}
 	ac := &AuthContext{}
-	err := a.checkEvidenceRequirement(nil, ac, &PipelineResult{})
+	err := a.checkEvidenceRequirement(&RequestView{}, ac, &PipelineResult{})
 	if err == nil {
 		t.Fatal("an unsatisfied requirement must refuse")
 	}
-	ae := asAuthError(err)
+	ae := AsAuthError(err)
 	if !strings.Contains(ae.Message, "missing roles") || !strings.Contains(ae.Message, "policy-permit") {
 		t.Errorf("message %q should name the missing role", ae.Message)
 	}
@@ -94,7 +94,7 @@ func TestCheckEvidenceRequirementUnknownIsFailClosed(t *testing.T) {
 		},
 	}}
 	ac := &AuthContext{}
-	err := a.checkEvidenceRequirement(nil, ac, &PipelineResult{})
+	err := a.checkEvidenceRequirement(&RequestView{}, ac, &PipelineResult{})
 	if err == nil {
 		t.Fatal("unknown must fail closed")
 	}
@@ -110,7 +110,7 @@ func TestCheckEvidenceRequirementFactErrorsFailClosed(t *testing.T) {
 			return nil, errors.New("evidence store unreachable")
 		},
 	}}
-	if err := a.checkEvidenceRequirement(nil, &AuthContext{}, &PipelineResult{}); err == nil {
+	if err := a.checkEvidenceRequirement(&RequestView{}, &AuthContext{}, &PipelineResult{}); err == nil {
 		t.Fatal("a facts error must refuse")
 	}
 }
@@ -119,7 +119,7 @@ func TestCheckEvidenceRequirementFactErrorsFailClosed(t *testing.T) {
 func TestCheckEvidenceRequirementDisabled(t *testing.T) {
 	a := &authenticator{cfg: &Config{}}
 	ac := &AuthContext{}
-	if err := a.checkEvidenceRequirement(nil, ac, &PipelineResult{}); err != nil {
+	if err := a.checkEvidenceRequirement(&RequestView{}, ac, &PipelineResult{}); err != nil {
 		t.Fatalf("no requirement must be a no-op: %v", err)
 	}
 	if ac.Satisfaction != nil {

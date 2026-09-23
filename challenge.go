@@ -101,20 +101,23 @@ func (c ChallengeConfig) now() time.Time {
 	return time.Now().UTC()
 }
 
-func (c ChallengeConfig) newID() string    { return c.randomToken(c.NewID) }
-func (c ChallengeConfig) newNonce() string { return c.randomToken(c.NewNonce) }
+func (c ChallengeConfig) newID() (string, error)    { return c.randomToken(c.NewID) }
+func (c ChallengeConfig) newNonce() (string, error) { return c.randomToken(c.NewNonce) }
 
-func (c ChallengeConfig) randomToken(override func() string) string {
+// randomToken produces a randomized token (16 random bytes, hex-encoded),
+// propagating the error from rand.Read. A challenge token is the enforcement
+// point's one-time-use marker: silently returning an empty string on RNG
+// failure (previously) turned "randomness unavailable" into a fixed, replayable
+// challenge value (M2).
+func (c ChallengeConfig) randomToken(override func() string) (string, error) {
 	if override != nil {
-		return override()
+		return override(), nil
 	}
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
-		// A challenge without an unpredictable nonce would be replayable, so
-		// give up rather than emit one; callers treat an error as "no challenge".
-		return ""
+		return "", fmt.Errorf("challenge: random token: %w", err)
 	}
-	return hex.EncodeToString(buf[:])
+	return hex.EncodeToString(buf[:]), nil
 }
 
 // buildChallengeForResult returns the challenge for a denial that presenting
@@ -133,12 +136,19 @@ func buildChallengeForResult(res *PipelineResult, cfg ChallengeConfig) (*semanti
 		if err != nil {
 			return nil, err
 		}
-		nonce := cfg.newNonce()
+		nonce, err := cfg.newNonce()
+		if err != nil {
+			return nil, err
+		}
 		if nonce == "" {
 			return nil, fmt.Errorf("challenge nonce unavailable")
 		}
+		id, err := cfg.newID()
+		if err != nil {
+			return nil, err
+		}
 		params := semantics.ChallengeParams{
-			ID:           cfg.newID(),
+			ID:           id,
 			Nonce:        nonce,
 			Audience:     cfg.Audience,
 			ActionDigest: actionDigest,

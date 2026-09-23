@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Jijie Wei (varwof)
 // SPDX-License-Identifier: Apache-2.0
 
-// Package gw provides the shared gateway core library for the varwof project.
 package aicverifier
 
-// Version is the package version, set via -ldflags -X github.com/varwof/gateway-core.Version=x.y.z.
-var Version = "0.1.0"
+// Version is the single source of truth for the aic-verifier version.
+// Every consumer reads this value (do not hard-code a version elsewhere).
+//
+// Released tag: v<Version>. Bump it and tag together (hack/versioncheck.sh
+// enforces that Version is not older than the latest tag).
+var Version = "0.2.0"

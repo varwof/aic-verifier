@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/varwof/register/semantics"
@@ -39,15 +41,21 @@ type Route struct {
 // Server is an AIC-protected HTTP reverse proxy. It terminates TLS (optionally
 // mTLS), runs the admission pipeline on every request, and forwards admitted
 // requests to the matching backend, injecting the verified client identity.
+//
+// Listener state is set once by Listen and read concurrently by Addr and Close,
+// so it is guarded by mu. Prefer Listen + Addr + Serve over ListenAndServe when
+// the caller needs the bound address (e.g. port 0) without polling.
 type Server struct {
 	cfg        *Config
 	routes     []Route
 	handler    http.Handler
 	transport  *http.Transport
-	srv        *http.Server
-	listener   net.Listener
 	log        *slog.Logger
 	revHeaders []string
+
+	mu       sync.Mutex
+	srv      *http.Server
+	listener net.Listener
 }
 
 // NewServer builds an AIC-protected reverse proxy server.
@@ -89,7 +97,7 @@ func NewServer(c *Config, routes []Route) (*Server, error) {
 		}
 		s.routes = append(s.routes, r)
 	}
-	next, err := c.Handler(http.HandlerFunc(s.proxy))
+	next, err := c.Handler(outcomeSelfReporting{http.HandlerFunc(s.proxy)})
 	if err != nil {
 		return nil, err
 	}
@@ -101,19 +109,21 @@ func NewServer(c *Config, routes []Route) (*Server, error) {
 // existing http.Server). Callers managing TLS themselves should use this.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// ListenAndServe starts the reverse-proxy server listening on addr. When
-// TLSCertFile/TLSKeyFile are configured the listener terminates TLS (mTLS when
-// CACertFile is also set).
-func (s *Server) ListenAndServe(addr string) error {
+// Listen binds the reverse-proxy listener on addr (TLS when
+// TLSCertFile/TLSKeyFile are configured, mTLS when CACertFile is also set) and
+// returns it. It does not begin serving; pass the listener to Serve. Use this
+// instead of ListenAndServe when the bound address is needed before serving
+// (a ":0" ephemeral port, for example) — read it with Addr.
+func (s *Server) Listen(addr string) (net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("aic-verifier: listen %s: %w", addr, err)
+		return nil, fmt.Errorf("aic-verifier: listen %s: %w", addr, err)
 	}
 	if s.cfg.TLSCertFile != "" {
 		cert, err := LoadCert(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
 		if err != nil {
 			ln.Close()
-			return err
+			return nil, err
 		}
 		tlsCfg := &tls.Config{
 			Certificates: []tls.Certificate{*cert},
@@ -123,14 +133,14 @@ func (s *Server) ListenAndServe(addr string) error {
 			pool, err := LoadCA(s.cfg.CACertFile)
 			if err != nil {
 				ln.Close()
-				return err
+				return nil, err
 			}
 			tlsCfg.ClientCAs = pool
 			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
 		}
 		ln = tls.NewListener(ln, tlsCfg)
 	}
-	s.listener = ln
+
 	srv := &http.Server{
 		Handler:           s.handler,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -154,16 +164,70 @@ func (s *Server) ListenAndServe(addr string) error {
 			srv.MaxHeaderBytes = o.MaxHeaderBytes
 		}
 	}
+
+	s.mu.Lock()
+	s.listener = ln
 	s.srv = srv
-	return s.srv.Serve(ln)
+	s.mu.Unlock()
+	return ln, nil
 }
 
-// Close gracefully shuts down the server.
-func (s *Server) Close(ctx context.Context) error {
-	if s.srv == nil {
+// Serve serves on a listener returned by Listen until Shutdown or Close. It
+// reports http.ErrServerClosed on a graceful shutdown. A listener not obtained
+// from Listen (no HTTP server prepared) is a configuration error.
+func (s *Server) Serve(ln net.Listener) error {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	if srv == nil {
+		return fmt.Errorf("aic-verifier: Serve requires a listener from Listen")
+	}
+	return srv.Serve(ln)
+}
+
+// Addr returns the address the server is listening on, or nil before Listen.
+// It is safe to call concurrently with Listen and Close.
+func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener == nil {
 		return nil
 	}
-	return s.srv.Shutdown(ctx)
+	return s.listener.Addr()
+}
+
+// ListenAndServe binds addr and serves until Close or a fatal serve error. It
+// is Listen followed by Serve; callers that need the bound address should call
+// those two directly.
+func (s *Server) ListenAndServe(addr string) error {
+	ln, err := s.Listen(addr)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ln)
+}
+
+// Close gracefully shuts down the server, releases the listener, and closes the
+// Config's owned resources (audit logger, nonce cache, supervision store, log
+// file) via Config.Close. It is safe to call before Listen (no-op) and more than
+// once. Closing the listener as well as calling Shutdown means a listener
+// obtained from Listen but never handed to Serve is still released.
+func (s *Server) Close(ctx context.Context) error {
+	s.mu.Lock()
+	srv := s.srv
+	ln := s.listener
+	s.mu.Unlock()
+	var err error
+	if srv != nil {
+		err = srv.Shutdown(ctx)
+		if ln != nil {
+			_ = ln.Close() // Shutdown may already have closed it; ignore the repeat
+		}
+	}
+	if s.cfg != nil {
+		err = errors.Join(err, s.cfg.Close())
+	}
+	return err
 }
 
 // proxy forwards an admitted request to the matched backend.
@@ -205,16 +269,28 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("Proxy-Authorization")
 	injectIdentityHeaders(r, ac, s.cfg.IdentityMode)
 
+	// Capture the real client IP before the reverse proxy runs. The proxy's
+	// Director runs with req.RemoteAddr already rewritten to the last hop, so
+	// recording the peer here is the only way to emit the true client in
+	// X-Forwarded-For (M4).
+	clientIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(clientIP); err == nil {
+		clientIP = host
+	}
+
+	// TODO(H2): NewSingleHostReverseProxy is constructed per admitted request,
+	// re-allocating the proxy and its per-route state (Director closure,
+	// rewrite machinery) every time. For high-throughput routes this should be
+	// built once per Route in NewServer and cached on the Server. The closure
+	// below is safe to share: it reads only per-request state (req, clientIP).
+	// Deferred because the structural change (per-route proxy table) is a
+	// larger refactor.
 	rp := httputil.NewSingleHostReverseProxy(route.Target)
 	rp.Transport = s.reverseProtocolTransport(route)
 	defaultDirector := rp.Director
 	rp.Director = func(req *http.Request) {
 		defaultDirector(req)
-		host, _, err := net.SplitHostPort(req.RemoteAddr)
-		if err != nil {
-			host = req.RemoteAddr
-		}
-		req.Header.Set("X-Forwarded-For", host)
+		req.Header.Set("X-Forwarded-For", clientIP)
 	}
 	// The reverse proxy swallows transport errors into a 502; capture them so
 	// the outcome record can say "indeterminate" instead of pretending the
@@ -302,8 +378,18 @@ func (s *Server) denialEvidence(r *http.Request, ae *AuthError) []RecordRef {
 // record it followed (empty when the admission produced no record: a gap, not
 // consent).
 func (s *Server) emitProxyOutcome(r *http.Request, ac *AuthContext, status int, transportErr bool) {
-	cfg := s.cfg.Evidence
-	if cfg == nil || !cfg.EmitOutcome || ac == nil {
+	reportObservedOutcome(s.cfg.Evidence, s.log, r, ac, status, transportErr)
+}
+
+// reportObservedOutcome reports the effect the request path observed for an
+// admitted request.  Both the reverse proxy (a response → observed + status; a
+// transport failure → indeterminate) and the middleware (a downstream handler
+// returned → observed + status) share this single emission point, so the
+// decision, admission and outcome records of one pipeline always ride the same
+// sink and the same recorder.  The outcome is classified as observed — the SDK
+// does not claim executed/failed, that judgement stays with the deployment.
+func reportObservedOutcome(cfg *EvidenceConfig, log *slog.Logger, r *http.Request, ac *AuthContext, status int, transportErr bool) {
+	if cfg == nil || !cfg.EmitOutcome || ac == nil || r == nil {
 		return
 	}
 	outcome := OutcomeObserved
@@ -337,12 +423,12 @@ func (s *Server) emitProxyOutcome(r *http.Request, ac *AuthContext, status int, 
 	}
 	sink := cfg.Sink
 	if sink == nil {
-		sink = SlogSink{Logger: s.log}
+		sink = SlogSink{Logger: log}
 	}
 	outSink, ok := sink.(OutcomeSink)
 	if !ok {
 		// A sink that does not know outcome records is an evidence gap for an
-		// EnitOutcome deployment — surfaced, never silent.
+		// EmitOutcome deployment — surfaced, never silent.
 		if cfg.OnError != nil {
 			cfg.gap()
 			cfg.OnError(ctx, fmt.Errorf("evidence: sink does not emit outcome records"))
@@ -354,7 +440,7 @@ func (s *Server) emitProxyOutcome(r *http.Request, ac *AuthContext, status int, 
 		if cfg.OnError != nil {
 			cfg.OnError(ctx, err)
 		} else {
-			logger := s.log
+			logger := log
 			if logger == nil {
 				logger = slog.Default()
 			}
@@ -375,6 +461,18 @@ type proxyStatusRecorder struct {
 func (r *proxyStatusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer so Hijack,
+// Push and the rest keep working when the middleware wraps a streaming or
+// upgraded downstream handler (EmitOutcome).
+func (r *proxyStatusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// Flush forwards flush support (SSE and similar) to the underlying writer.
+func (r *proxyStatusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // backendRootPool builds the trust pool for the reverse proxy's outbound TLS

@@ -28,6 +28,12 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
+      - name: Version tag is not behind (single source of truth)
+        run: ./hack/versioncheck.sh
+
+      - name: Consumer view (dependencies from the module proxy)
+        run: ./hack/consumer-view.sh
+
       - name: Vet
         run: go vet ./...
 
@@ -42,3 +48,6 @@ jobs:
 
       - name: Smoke (build tag)
         run: go test -tags smoke ./smoke/
+
+      - name: Showcase (end-to-end, must exit 0)
+        run: go run ./examples/showcase

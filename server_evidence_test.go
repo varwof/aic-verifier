@@ -190,10 +190,16 @@ func TestProxyEmitsOutcomeRecord(t *testing.T) {
 		t.Fatalf("/err status = %d, want 500", resp.StatusCode)
 	}
 
-	// The admitted request froze a decision record; both outcomes must point at it.
+	// Each admission froze its own decision record: the per-admission nonce makes
+	// the input digest unique per instance (P3 gap-two), so two identical
+	// operations on two requests must NOT collapse into one wildcard digest.
+	// Each outcome must then point at the exact decision that admitted it.
 	decisionDigest := decisionDigests(t, recDir)
-	if len(decisionDigest) != 1 {
-		t.Fatalf("expected one decision record, got %v", decisionDigest)
+	if len(decisionDigest) != 2 {
+		t.Fatalf("expected two distinct decision records (one per admission), got %v", decisionDigest)
+	}
+	if decisionDigest[0] == decisionDigest[1] {
+		t.Fatalf("two admissions share one decision digest %q; per-admission nonce failed", decisionDigest[0])
 	}
 
 	outcomes := outcomeRecordsOnDisk(t, recDir)
@@ -206,12 +212,82 @@ func TestProxyEmitsOutcomeRecord(t *testing.T) {
 			t.Errorf("%s: outcome = %q, want observed", path, rec.Outcome)
 		}
 		statuses[rec.StatusCode] = true
-		if rec.DecisionDigest != decisionDigest[0] {
-			t.Errorf("%s: decisionDigest %q does not point at the admission record %q", path, rec.DecisionDigest, decisionDigest[0])
+		if rec.DecisionDigest == "" {
+			t.Errorf("%s: decisionDigest empty, want one of %v", path, decisionDigest)
+			continue
+		}
+		linked := false
+		for _, d := range decisionDigest {
+			if rec.DecisionDigest == d {
+				linked = true
+			}
+		}
+		if !linked {
+			t.Errorf("%s: decisionDigest %q does not point at any admission record %v", path, rec.DecisionDigest, decisionDigest)
 		}
 	}
 	if !statuses[200] || !statuses[500] {
 		t.Errorf("statuses = %v, want 200 and 500", statuses)
+	}
+}
+
+// TestMiddlewareEmitsOutcomeRecord: Config.Handler（中间件集成方式）在 next 返回后
+// report outcome（observed + status），decisionDigest 与准入决策一致。代理之外的主
+// 要集成形态此前完全不发 outcome（P3-gap1）。
+func TestMiddlewareEmitsOutcomeRecord(t *testing.T) {
+	ca := newHTTPTestCA(t)
+	client := ca.issueAIC(t, "agent-mw-outcome",
+		[]pki.Capability{{SchemeId: "std/database-v1", CapabilityId: "query:SELECT", Parameters: []byte(`{"limit":10}`)}})
+	recDir := t.TempDir()
+
+	cfg := &Config{
+		CACertFile: ca.writePEM(t),
+		AuthMode:   MTLSOnly,
+		RequireAIC: true,
+		RequiredOperations: []Operation{
+			{ID: "std/database-v1:query:SELECT", Params: map[string]any{"limit": 5}},
+		},
+		Evidence: &EvidenceConfig{
+			Sink:        &FileSink{Dir: recDir},
+			RecorderID:  "pep-mw",
+			EmitOutcome: true,
+		},
+	}
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ac := FromContext(r.Context()); ac == nil {
+			t.Errorf("downstream handler must see the admitted identity")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	h, err := cfg.Handler(next)
+	if err != nil {
+		t.Fatalf("Handler: %v", err)
+	}
+	url := startMTLSEvidenceTest(t, ca, h)
+
+	resp, _ := doMTLSEvidenceTest(t, url+"/api/data", client)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+
+	decisionDigest := decisionDigests(t, recDir)
+	if len(decisionDigest) != 1 {
+		t.Fatalf("expected one decision record, got %v", decisionDigest)
+	}
+	outcomes := outcomeRecordsOnDisk(t, recDir)
+	if len(outcomes) != 1 {
+		t.Fatalf("got %d outcome records, want 1 (the middleware must report outcomes)", len(outcomes))
+	}
+	for path, rec := range outcomes {
+		if rec.Outcome != OutcomeObserved {
+			t.Errorf("%s: outcome = %q, want observed", path, rec.Outcome)
+		}
+		if rec.StatusCode != http.StatusNoContent {
+			t.Errorf("%s: status = %d, want 204", path, rec.StatusCode)
+		}
+		if rec.DecisionDigest != decisionDigest[0] {
+			t.Errorf("%s: decisionDigest %q does not point at the admission record %q", path, rec.DecisionDigest, decisionDigest[0])
+		}
 	}
 }
 

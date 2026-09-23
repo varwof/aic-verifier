@@ -22,6 +22,22 @@ type toolImpl struct {
 	impl ToolHandler
 }
 
+// toolAuthKey carries the admitted identity into a tool handler's derived
+// context (see newToolImpl.handle). It is distinct from mcpAuthKey so handler
+// code receives the identity only when the enforcement layer ran.
+type toolAuthKey struct{}
+
+// AuthContextFromToolContext returns the admitted identity that a tool handler
+// received. It is nil when the handler ran outside the aic-verifier
+// enforcement layer (fail-closed for directly embedded SDK users).
+func AuthContextFromToolContext(ctx context.Context) *aicverifier.AuthContext {
+	if ctx == nil {
+		return nil
+	}
+	ac, _ := ctx.Value(toolAuthKey{}).(*aicverifier.AuthContext)
+	return ac
+}
+
 func newToolImpl(spec *ToolSpec, impl ToolHandler) (*toolImpl, error) {
 	if spec == nil || impl == nil {
 		return nil, fmt.Errorf("nil spec or handler")
@@ -39,6 +55,13 @@ func (t *toolImpl) handle(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	}
 	if !capsAllow(ac, t.spec.RequiredCapability) {
 		return nil, fmt.Errorf("tool %q requires capability %q", t.spec.Name, t.spec.RequiredCapability)
+	}
+	// Surface the admitted identity to the tool handler. The key stays a
+	// per-request value (never the mcpAuthKey): handler code calls
+	// AuthContextFromToolContext, not FromContext, so a handler executed
+	// without the enforcement layer still fails closed.
+	if ac != nil {
+		ctx = context.WithValue(ctx, toolAuthKey{}, ac)
 	}
 	raw := req.Params.RawArguments
 	if len(raw) == 0 {

@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,6 +32,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/varwof/register/semantics"
@@ -81,7 +84,11 @@ type Config struct {
 	// JWTAudience, when non-empty, requires the AIC-JWT aud claim to include one.
 	JWTAudience []string
 	// ReplayProtection enables one-time-use replay protection on bearer tokens
-	// (default true).
+	// (default true).  When enabled every verified token's jti is single-use:
+	// a compliant client mints one token per request (aic-agent local Key mode
+	// does this); a pre-minted token shared across requests will be rejected as
+	// a replay on its second use.  A token not minted per request and no
+	// client-side per-request mint → set this to false.
 	ReplayProtection *bool
 
 	// IdentityMode selects how much verified client identity is forwarded to
@@ -98,6 +105,15 @@ type Config struct {
 	RequireAIC bool
 	// RequiredCapabilities requires the agent to hold all listed CapabilityIds.
 	RequiredCapabilities []string
+	// AdminToken, when non-empty, is the shared secret that must be presented
+	// (Authorization: Bearer) to POST /reload on the AdminHandler.  Empty and
+	// no AdminTokenFile → /reload is refused (fail-closed): the policy hot
+	// reload seam is never left unauthenticated, so a listener that accidentally
+	// exposes the admin mux cannot be used to install an arbitrary policy.
+	AdminToken string
+	// AdminTokenFile, when non-empty, loads AdminToken from a secrets file at
+	// startup (trailing newline trimmed).  Precedence: AdminToken wins.
+	AdminTokenFile string
 	// RequiredOperations are the concrete actions (id + parameters) this
 	// service authorizes.  Unlike RequiredCapabilities, parameter bounds are
 	// part of the decision (CLC): an operation asking for more than the grant
@@ -185,6 +201,19 @@ type Config struct {
 	// CapabilityRegistry validates AIC-declared capabilities are registered.
 	// Nil falls back to the global registry.
 	CapabilityRegistry CapabilityRegistry
+	// AuthorizationPolicy, when non-nil, selects the OU→role mapping this
+	// gateway uses instead of the package-global policy (per-Config
+	// isolation: several gateways in one process can hold distinct policies).
+	// Nil falls back to SetAuthorizationPolicy's global.
+	AuthorizationPolicy *AuthorizationPolicy
+	// Constraints, when non-nil, selects the constraint evaluator registry this
+	// gateway uses instead of the package-global registry (per-Config
+	// isolation). Nil falls back to the global registry.
+	Constraints *ConstraintRegistry
+	// ParameterValidators, when non-nil, selects the parameter boundary
+	// validator registry (e.g. MaxRowsValidator) this gateway uses.  Nil keeps
+	// parameter boundary validation disabled (opt-in at the global default).
+	ParameterValidators *ParameterValidatorRegistry
 
 	// Logger is the structured logger (default slog.Default()).
 	Logger *slog.Logger
@@ -241,6 +270,32 @@ type Config struct {
 	ServerOptions *ServerOptions
 
 	logFile *os.File // lazily opened source for LogFile (owned by this config)
+
+	// metrics is the admission counter set shared by every authenticator built
+	// from this Config (middleware and DecisionServer alike), so counters
+	// recorded on the middleware path are readable via Config.Metrics/Health.
+	// Lazily created under metricsInitMu; the pointer keeps Config copyable.
+	metrics *DecisionMetrics
+}
+
+// metricsInitMu serializes the lazy creation of Config.metrics. It is
+// package-level (not a Config field) so Config stays a plain copyable struct.
+var metricsInitMu sync.Mutex
+
+// Metrics returns the admission counter set this Config records decisions
+// into, creating it on first use. Middleware deployments (Config.Handler /
+// Config.AuthMiddleware) that have no DecisionServer handle read their counters
+// and readiness through here (see also Config.Health).
+func (c *Config) Metrics() *DecisionMetrics {
+	if c == nil {
+		return nil
+	}
+	metricsInitMu.Lock()
+	defer metricsInitMu.Unlock()
+	if c.metrics == nil {
+		c.metrics = NewDecisionMetrics()
+	}
+	return c.metrics
 }
 
 // ServerOptions tunes the embedded http.Server of the reverse proxy.
@@ -252,6 +307,42 @@ type ServerOptions struct {
 	MaxHeaderBytes    int
 }
 
+// Validate performs the static configuration checks that otherwise surface only
+// at construction time. It is side-effect-free — no CA pools, JWT verifiers or
+// material files are loaded — and safe to call from CI. Material loading still
+// happens when a handler or server is built (Handler, NewServer).
+func (c *Config) Validate() error {
+	if c == nil {
+		return errors.New("aic-verifier: nil config")
+	}
+	var errs []error
+	if c.EvidenceProfile != "" {
+		if _, err := LookupEvidenceProfile(c.EvidenceProfile); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if c.RequireUserAuth && c.UserCert == nil && c.UserCertResolver == nil && c.CACertFile == "" {
+		errs = append(errs, fmt.Errorf("aic-verifier: require_user_auth needs user cert for DA verification"))
+	}
+	if c.SupervisionPolicy.RequireRuntimeApproval && c.ApprovalRequester == nil {
+		errs = append(errs, fmt.Errorf("aic-verifier: require_runtime_approval needs an ApprovalRequester"))
+	}
+	if c.SupervisionPolicy.AllowBreakGlass && c.OverrideRecorder == nil {
+		errs = append(errs, fmt.Errorf("aic-verifier: allow_break_glass needs an OverrideRecorder"))
+	}
+	if c.SupervisionPolicy.RequireEvidenceExport && c.EvidenceExporter == nil {
+		errs = append(errs, fmt.Errorf("aic-verifier: require_evidence_export needs an EvidenceExporter"))
+	}
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	default:
+		return errors.Join(errs...)
+	}
+}
+
 // CloseLogger releases the file opened for LogFile (no-op when none set).
 func (c *Config) CloseLogger() error {
 	if c == nil || c.logFile == nil {
@@ -260,6 +351,45 @@ func (c *Config) CloseLogger() error {
 	err := c.logFile.Close()
 	c.logFile = nil
 	return err
+}
+
+// Close releases every resource the Config owns: the nonce cache's cleanup
+// goroutine, the supervision store, the audit logger (draining buffered
+// entries), and the SDK log file. It is idempotent — each child close is
+// itself idempotent — so Server.Close and DecisionServer.Close can cascade to
+// it without the caller tracking which pieces were wired.
+//
+// Close stops components the caller supplied through Config fields; it owns the
+// *lifecycle*, not the memory. CRL and OCSP refresh loops are run by the
+// caller's own stop channel (CRLCache.Start, StartOCSPStapling) and are
+// therefore not cascaded here.
+//
+// Config deliberately carries no lock so it stays copyable; the individual
+// child closes provide the idempotency. Do not call Close concurrently with
+// itself on the same Config.
+func (c *Config) Close() error {
+	if c == nil {
+		return nil
+	}
+	var errs []error
+	if c.NonceCache != nil {
+		c.NonceCache.Stop()
+	}
+	if c.SupervisionStore != nil {
+		if err := c.SupervisionStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	// Audit last so records emitted while tearing the rest down are drained.
+	if c.AuditLogger != nil {
+		if err := c.AuditLogger.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := c.CloseLogger(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (c *Config) logger() *slog.Logger {
@@ -293,9 +423,20 @@ func (c *Config) replayProtection() bool {
 	return *c.ReplayProtection
 }
 
+// outcomeSelfReporting marks a downstream handler that already reports outcome
+// records itself (the built-in reverse proxy, which alone can tell a backend
+// *response* from a *transport failure*).  NewServer passes its proxy wrapped
+// in this marker so the middleware probe defers to it instead of double-reporting
+// — a transport failure must stay indeterminate, never reclassified as observed
+// through a 502 status caught by the outer recorder.
+type outcomeSelfReporting struct{ http.Handler }
+
 // Handler builds a http.Handler that protects next with the AIC admission
 // pipeline. On success the verified client identity is attached to the request
-// context and pass-through headers are set on req.Header.
+// context and pass-through headers are set on req.Header.  When
+// Evidence.EmitOutcome is set and next does not report outcomes itself (see
+// outcomeSelfReporting), the middleware observes the downstream handler and
+// reports the outcome (observed + status).
 func (c *Config) Handler(next http.Handler) (http.Handler, error) {
 	if next == nil {
 		next = http.NotFoundHandler()
@@ -304,11 +445,15 @@ func (c *Config) Handler(next http.Handler) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	probeOutcome := a.cfg.Evidence != nil && a.cfg.Evidence.EmitOutcome
+	if _, selfReporting := next.(outcomeSelfReporting); selfReporting {
+		probeOutcome = false
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, err := a.Authenticate(r)
 		if err != nil {
-			ae := asAuthError(err)
-			ae.Evidence = append(ae.Evidence, a.refusalEvidence(r, ae)...)
+			ae := AsAuthError(err)
+			ae.Evidence = append(ae.Evidence, a.refusalEvidence(viewFromHTTP(a.cfg, r), ae)...)
 			if a.cfg.Hooks != nil && a.cfg.Hooks.Denied != nil {
 				a.cfg.Hooks.Denied(r, ae)
 			}
@@ -327,6 +472,20 @@ func (c *Config) Handler(next http.Handler) (http.Handler, error) {
 				a.writeError(w, denied)
 				return
 			}
+		}
+		if probeOutcome {
+			// The middleware observes the downstream handler the same way the
+			// reverse proxy observes its backend: a response → observed +
+			// status, wired to the decision that admitted it.  The recorder
+			// normalizes a never-written status to 200 (net/http semantics).
+			rec := &proxyStatusRecorder{ResponseWriter: w}
+			next.ServeHTTP(rec, r)
+			status := rec.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			reportObservedOutcome(a.cfg.Evidence, a.log, r, ctx, status, false)
+			return
 		}
 		next.ServeHTTP(w, r)
 	}), nil
@@ -412,9 +571,14 @@ type authenticator struct {
 	ocsp       *OCSPCache
 	audit      *AuditLogger
 	nonceCache *NonceCache
+	metrics    *DecisionMetrics
+	policy     atomic.Pointer[authPolicyBundle]
 }
 
 func newAuthenticator(c *Config) (*authenticator, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
 	a := &authenticator{
 		cfg:        c,
 		log:        c.logger(),
@@ -422,6 +586,7 @@ func newAuthenticator(c *Config) (*authenticator, error) {
 		ocsp:       c.OCSPCache,
 		audit:      c.AuditLogger,
 		nonceCache: c.NonceCache,
+		metrics:    c.Metrics(),
 	}
 
 	if c.EvidenceProfile != "" {
@@ -464,15 +629,6 @@ func newAuthenticator(c *Config) (*authenticator, error) {
 	if c.RequireUserAuth && c.UserCert == nil && c.UserCertResolver == nil && c.CACertFile == "" {
 		return nil, fmt.Errorf("aic-verifier: require_user_auth needs user cert for DA verification")
 	}
-	if c.SupervisionPolicy.RequireRuntimeApproval && c.ApprovalRequester == nil {
-		return nil, fmt.Errorf("aic-verifier: require_runtime_approval needs an ApprovalRequester")
-	}
-	if c.SupervisionPolicy.AllowBreakGlass && c.OverrideRecorder == nil {
-		return nil, fmt.Errorf("aic-verifier: allow_break_glass needs an OverrideRecorder")
-	}
-	if c.SupervisionPolicy.RequireEvidenceExport && c.EvidenceExporter == nil {
-		return nil, fmt.Errorf("aic-verifier: require_evidence_export needs an EvidenceExporter")
-	}
 	return a, nil
 }
 
@@ -487,144 +643,59 @@ func loadPEMIntoPool(pool *x509.CertPool, path string) error {
 	return nil
 }
 
-// Authenticate runs the admission pipeline for a single request. The returned
+// Authenticate runs the admission pipeline for a single HTTP request.  It is a
+// thin binding: the request is lowered to a transport-neutral RequestView and
+// handed to the Decide decision core, so the HTTP middleware, the gRPC binding
+// and direct in-process callers all reach the identical decision.  The returned
 // AuthContext is non-nil on success; error is an *AuthError so callers can map
 // decision failures to status codes.
 func (a *authenticator) Authenticate(r *http.Request) (*AuthContext, error) {
-	chain, clientCert, bearer, err := a.extractClient(r)
-	if err != nil {
-		return nil, err
-	}
-	if chain == nil {
-		chain = []*x509.Certificate{}
-	}
-	if clientCert == nil {
-		return nil, &AuthError{Code: ErrNoCredential, Status: http.StatusUnauthorized, Message: "no client credential presented"}
-	}
-
-	// Fail-closed (S2): if a client presented a certificate but no mTLS CA pool
-	// was configured, refuse the request rather than accepting an unverified chain.
-	if !bearer && a.tlsCAs == nil && len(chain) > 0 {
-		return nil, &AuthError{Code: ErrChainInvalid, Status: http.StatusForbidden, Message: "client certificate presented but no mTLS CA configured to verify it"}
-	}
-
-	if a.tlsCAs != nil && !bearer {
-		if err := buildChain(a.tlsCAs, chain); err != nil {
-			return nil, &AuthError{Code: ErrChainInvalid, Status: http.StatusForbidden, Message: err.Error()}
-		}
-	}
-
-	var opBody []byte
+	view := viewFromHTTP(a.cfg, r)
 	if !a.cfg.StreamBody && r.Body != nil {
-		opBody, _ = io.ReadAll(io.LimitReader(r.Body, DefaultMaxBodyBytes))
-		r.Body = io.NopCloser(bytes.NewReader(opBody))
+		view.Body, _ = io.ReadAll(io.LimitReader(r.Body, DefaultMaxBodyBytes))
+		r.Body = io.NopCloser(bytes.NewReader(view.Body))
 	}
+	return a.Decide(r.Context(), view)
+}
 
-	result := RunAccessPipeline(chain, &PipelineConfig{
-		CRLCache:                    a.crl,
-		OCSPCache:                   a.ocsp,
-		CheckScope:                  CheckFullChain,
-		RequireAIC:                  a.cfg.RequireAIC,
-		RequiredCapabilities:        a.cfg.RequiredCapabilities,
-		Operations:                  a.cfg.RequiredOperations,
-		UnresolvedEvaluator:         a.cfg.UnresolvedEvaluator,
-		DischargeObligations:        a.cfg.DischargeObligations,
-		ObligationsUnderstood:       a.cfg.ObligationsUnderstood,
-		RequireFreshDecisionContext: a.cfg.RequireFreshDecisionContext,
-		DecisionContext:             a.cfg.DecisionContext,
-		DisallowRepresentative:      a.cfg.DisallowRepresentative,
-		RequireUserAuth:             a.cfg.RequireUserAuth,
-		ClientIP:                    clientIPOf(r),
-		EnforceConstraints:          a.cfg.EnforceConstraints,
-		StrictConstraints:           true,
-		CapabilityPluginRegistry:    a.cfg.PluginRegistry,
-		CapabilityRegistry:          a.cfg.CapabilityRegistry,
-		AuditLogger:                 a.audit,
-		NonceCache:                  a.nonceCache,
-		UserCert:                    a.cfg.UserCert,
-		UserCertResolver:            a.cfg.UserCertResolver,
-		HTTPFacts:                   httpFactsFor(r, opBody),
-	})
-	if !result.Granted {
-		a.log.Warn("aic-verifier: admission denied", "reason", result.DenyReason, "path", r.URL.Path)
-		// A refused operation is evidence too: record the decisions that were
-		// made before denying (same per-source shape as the allow path).
-		refs, evErr := a.emitEvidence(r, clientCert, result, EvidenceRefused)
-		a.auditAdmission(r, clientCert, refs, true, result.DenyReason)
-		if evErr != nil && a.cfg.Evidence != nil && a.cfg.Evidence.Strict {
-			return nil, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_unavailable: " + evErr.Error(), Evidence: refs}
-		}
-		// A denial that evidence can fix carries a challenge; anything else
-		// keeps the plain error (a challenge must not dress up a hard refusal).
-		problem, err := problemForResult(result, a.cfg.Challenges, result.DenyReason)
-		if err != nil {
-			a.log.Warn("aic-verifier: challenge build failed", "error", err, "path", r.URL.Path)
-		}
-		return nil, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: result.DenyReason, Problem: problem, Evidence: refs}
+// viewFromHTTP lowers a net/http request to the transport-neutral view the
+// decision core consumes.  The request itself rides along as the adaptee so
+// deployment hooks keyed on *http.Request (EvidenceFacts, RequireApproval)
+// keep working unchanged.
+func viewFromHTTP(cfg *Config, r *http.Request) *RequestView {
+	v := &RequestView{
+		Method:   r.Method,
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+		Header:   r.Header,
+		ClientIP: clientIPOf(r),
 	}
-
-	ac := &AuthContext{
-		ClientCert:         clientCert,
-		Principal:          result.Principal,
-		AgentID:            result.AgentId,
-		SPIFFEID:           result.SPIFFEID,
-		Roles:              result.Roles,
-		Serial:             result.Serial,
-		Bearer:             bearer,
-		AIC:                result.AIC,
-		Verdict:            result.CLCVerdict,
-		Reason:             result.CLCReason,
-		Unresolved:         result.CLCUnresolved,
-		OperationDecisions: result.OperationDecisions,
-	}
-	// The admitted call leaves a replayable record: freeze the per-source
-	// decisions before anything downstream can act on them.
-	evidenceRefs, evErr := a.emitEvidence(r, clientCert, result, EvidenceAdmitted)
-	if evErr != nil && a.cfg.Evidence != nil && a.cfg.Evidence.Strict {
-		return nil, &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_unavailable: " + evErr.Error(), Evidence: evidenceRefs}
-	}
-	ac.Evidence = evidenceRefs
-	a.auditAdmission(r, clientCert, evidenceRefs, false, "")
-
-	if result.AIC != nil {
-		for _, cap := range result.AIC.Capabilities {
-			ac.Capabilities = append(ac.Capabilities, cap.CapabilityId)
-		}
-	} else if pa := result.PrincipalAuthorization; pa != nil {
-		// A human certificate carries no AIC extension: its authority is the
-		// PrincipalAuthorization extension (spec: enterprise privilege
-		// autonomy).  Surface those grants so downstream code sees what the
-		// caller was actually authorized with, instead of an empty list that
-		// reads as "no permissions" for a request that was just admitted.
-		for _, g := range pa.Grants {
-			ac.Capabilities = append(ac.Capabilities, g.CapabilityId)
+	v.TransportSecure = r.TLS != nil
+	if r.TLS != nil {
+		v.CertChain = r.TLS.PeerCertificates
+		if len(r.TLS.PeerCertificates) > 0 {
+			v.PresentedCert = r.TLS.PeerCertificates[0]
 		}
 	}
-
-	// Evidence sufficiency (CLC-E): the deployment's requirement is evaluated
-	// against the facts it presented.  Satisfied admits; violated or unknown
-	// refuses, and the refusal carries the machine-readable challenge saying
-	// what is still needed.  This is not the authorization decision — it is the
-	// "is there enough evidence" half, and neither stands in for the other.
-	if err := a.checkEvidenceRequirement(r, ac, result); err != nil {
-		return nil, err
-	}
-
-	// Mid-operation supervision (design draft §3, decision-path hook before
-	// admission): RequireApproval flags requests that need runtime human
-	// approval.  The approval path is fail-closed — denied, pending, error or
-	// a nil requester all deny with approval_required.
-	if err := a.supervise(r, ac, opBody); err != nil {
-		return nil, err
-	}
-	return ac, nil
+	v.BearerToken = bearerToken(r)
+	v.HTTPAdapter = r
+	return v
 }
 
 // supervise runs the runtime human approval path for requests flagged by
 // RequireApproval.  It returns a nil error when the request is admitted, or an
-// *AuthError denying it otherwise.
-func (a *authenticator) supervise(r *http.Request, ac *AuthContext, opBody []byte) error {
-	if !a.cfg.needRuntimeApproval(ac, r) {
+// *AuthError denying it otherwise.  The decision core decides on the
+// transport-neutral view; carriers that cannot build an *http.Request supply
+// RequireApprovalWith on the view.
+func (a *authenticator) supervise(ctx context.Context, view *RequestView, ac *AuthContext, opBody []byte) error {
+	needs := false
+	switch {
+	case view != nil && view.RequireApprovalWith != nil:
+		needs = view.RequireApprovalWith(ac)
+	case view != nil && view.HTTPAdapter != nil:
+		needs = a.cfg.needRuntimeApproval(ac, view.HTTPAdapter)
+	}
+	if !needs {
 		return nil
 	}
 	risk := RiskAssessment{
@@ -633,10 +704,10 @@ func (a *authenticator) supervise(r *http.Request, ac *AuthContext, opBody []byt
 		PrincipalUid:    ac.Principal,
 		DAHash:          DAHash(ac.ClientCert),
 		Capabilities:    ac.Capabilities,
-		Operation:       r.Method + " " + r.URL.Path,
+		Operation:       view.Method + " " + view.Path,
 		RequestedParams: NewSummaryFromBody(opBody),
 	}
-	sr, err := a.requestApproval(r.Context(), risk)
+	sr, err := a.requestApproval(ctx, risk)
 	if err != nil {
 		a.log.Warn("aic-verifier: runtime approval failed", "operation_id", risk.OperationID, "err", err)
 		a.noteSupervision(pki.SupervisionDenied, risk, "aic-verifier", "approval_required: "+err.Error())
@@ -695,36 +766,6 @@ func (a *authenticator) noteSupervision(t pki.SupervisionEventType, risk RiskAss
 	}
 }
 
-// extractClient resolves the peer certificate or Bearer token to a certificate
-// for the pipeline. Returns the full chain (may be nil for bearer synthesis).
-func (a *authenticator) extractClient(r *http.Request) ([]*x509.Certificate, *x509.Certificate, bool, error) {
-	mode := a.cfg.authMode()
-	var chain []*x509.Certificate
-	if r.TLS != nil {
-		chain = r.TLS.PeerCertificates
-	}
-	if len(chain) > 0 && (mode == MTLSOnly || mode == MTLSOrBearer) {
-		return chain, chain[0], false, nil
-	}
-	// Bearer AIC-JWT fallback.
-	if mode == BearerOnly || mode == MTLSOrBearer {
-		if tok := bearerToken(r); tok != "" {
-			if a.verifier == nil {
-				return nil, nil, false, &AuthError{Code: ErrNoVerifier, Status: http.StatusUnauthorized, Message: "bearer auth not configured"}
-			}
-			if r.TLS == nil {
-				return nil, nil, false, &AuthError{Code: ErrBearerNeedsTLS, Status: http.StatusUnauthorized, Message: "bearer token requires a TLS transport"}
-			}
-			cert, _, err := a.verifier.VerifyBearer(tok, time.Now())
-			if err != nil {
-				return nil, nil, false, &AuthError{Code: ErrInvalidBearer, Status: http.StatusUnauthorized, Message: fmt.Sprintf("invalid bearer token: %v", err)}
-			}
-			return []*x509.Certificate{cert}, cert, true, nil
-		}
-	}
-	return chain, nil, false, nil
-}
-
 func clientIPOf(r *http.Request) string {
 	host := r.RemoteAddr
 	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
@@ -769,27 +810,10 @@ func bearerToken(r *http.Request) string {
 	return tok
 }
 
-// httpFactsFor builds the HTTP facts used by capability plugins.
-func httpFactsFor(r *http.Request, body []byte) *HTTPFacts {
-	hdr := make(map[string]string, len(r.Header))
-	for k, vs := range r.Header {
-		if len(vs) > 0 {
-			hdr[k] = vs[0]
-		}
-	}
-	return &HTTPFacts{
-		Method:  r.Method,
-		Path:    r.URL.Path,
-		Query:   r.URL.Query(),
-		Headers: hdr,
-		Body:    body,
-	}
-}
-
 // writeError writes the refusal: a problem document when the AuthError carries
 // one (the CLC challenge carrier), a compact JSON error otherwise.
 func (a *authenticator) writeError(w http.ResponseWriter, err error) {
-	writeAuthError(w, asAuthError(err), a.cfg)
+	writeAuthError(w, AsAuthError(err), a.cfg)
 }
 
 // ErrorCode identifies the kind of admission failure.
@@ -850,7 +874,7 @@ type AuthError struct {
 
 func (e *AuthError) Error() string { return e.Message }
 
-func asAuthError(err error) *AuthError {
+func AsAuthError(err error) *AuthError {
 	if e, ok := err.(*AuthError); ok {
 		return e
 	}
@@ -864,16 +888,16 @@ func asAuthError(err error) *AuthError {
 // decision's evidence record (record_digest = refs[0].Digest) so the audit
 // chain and the record chain cross-reference each other.  No-op when audit
 // logging is disabled or the decision produced no record.
-func (a *authenticator) auditAdmission(r *http.Request, clientCert *x509.Certificate, refs []RecordRef, denied bool, reason string) {
-	if a.audit == nil || len(refs) == 0 {
+func (a *authenticator) auditAdmission(view *RequestView, clientCert *x509.Certificate, refs []RecordRef, denied bool, reason string) {
+	if a.audit == nil || len(refs) == 0 || view == nil {
 		return
 	}
-	entry := NewAuditEntryFromConn(clientIPOf(r), r.Method, r.URL.Path, clientCert)
+	entry := NewAuditEntryFromConn(view.ClientIP, view.Method, view.Path, clientCert)
 	if denied {
 		entry.Action = string(ActionDenied)
 		entry.DenyReason = reason
 	}
-	entry.TraceId = r.Header.Get("X-Request-Id")
+	entry.TraceId = view.TraceID()
 	entry.RecordDigest = refs[0].Digest
 	a.audit.Log(entry)
 }
@@ -886,7 +910,7 @@ func (a *authenticator) auditAdmission(r *http.Request, clientCert *x509.Certifi
 // An emission failure is reported through EvidenceConfig.OnError (a deployment
 // wants to know about evidence gaps, not only about requests) and returned to
 // the caller for the Strict decision.
-func (a *authenticator) emitEvidence(r *http.Request, clientCert *x509.Certificate, result *PipelineResult, outcome EvidenceOutcome) ([]RecordRef, error) {
+func (a *authenticator) emitEvidence(view *RequestView, clientCert *x509.Certificate, result *PipelineResult, outcome EvidenceOutcome) ([]RecordRef, error) {
 	cfg := a.cfg.Evidence
 	if cfg == nil || result == nil || len(result.OperationDecisions) == 0 {
 		return nil, nil
@@ -898,15 +922,20 @@ func (a *authenticator) emitEvidence(r *http.Request, clientCert *x509.Certifica
 		Serial:     result.Serial,
 		Outcome:    outcome,
 		At:         cfg.now(),
-		Facts:      a.admissionFacts(r, result.OperationDecisions),
+		Facts:      a.admissionFacts(view, result.OperationDecisions),
 	}
-	if r != nil {
-		ctx.Method = r.Method
-		ctx.Path = r.URL.Path
-		ctx.TraceID = r.Header.Get("X-Request-Id")
+	if view != nil {
+		ctx.Method = view.Method
+		ctx.Path = view.Path
+		ctx.TraceID = view.TraceID()
 	}
 	if cfg.Requirement == nil {
-		cfg.Requirement = a.cfg.EvidenceRequirement
+		// Never mutate the deployment's shared config: one middleware serves
+		// every request, and a lazy backfill here would race with the reads of
+		// other concurrent admissions.  Backfill onto a per-emission copy.
+		ec := *cfg
+		ec.Requirement = a.cfg.EvidenceRequirement
+		cfg = &ec
 	}
 	refs, err := EmitDecisionRecords(cfg, ctx, clientCert, result.AIC, result.PrincipalAuthorization, a.cfg.UserCert, result.OperationDecisions)
 	if err != nil {
@@ -933,7 +962,7 @@ func (a *authenticator) emitEvidence(r *http.Request, clientCert *x509.Certifica
 //
 // The guard is deliberate: one refusal, one record.  Adding an admission record
 // on top of CLC records would describe the same decision twice, in two types.
-func (a *authenticator) refusalEvidence(r *http.Request, ae *AuthError) []RecordRef {
+func (a *authenticator) refusalEvidence(view *RequestView, ae *AuthError) []RecordRef {
 	cfg := a.cfg.Evidence
 	if cfg == nil || ae == nil || len(ae.Evidence) > 0 {
 		return nil
@@ -943,15 +972,15 @@ func (a *authenticator) refusalEvidence(r *http.Request, ae *AuthError) []Record
 		Outcome:    EvidenceRefused,
 		At:         cfg.now(),
 	}
-	if r != nil {
-		ctx.Method = r.Method
-		ctx.Path = r.URL.Path
-		ctx.TraceID = r.Header.Get("X-Request-Id")
-		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-			ctx.Serial = r.TLS.PeerCertificates[0].SerialNumber.Text(16)
+	if view != nil {
+		ctx.Method = view.Method
+		ctx.Path = view.Path
+		ctx.TraceID = view.TraceID()
+		if view.PresentedCert != nil {
+			ctx.Serial = view.PresentedCert.SerialNumber.Text(16)
 		}
 	}
-	ctx.Facts = append(ctx.Facts, a.admissionFacts(r, nil)...)
+	ctx.Facts = append(ctx.Facts, a.admissionFacts(view, nil)...)
 
 	return recordRefusal(cfg, a.log, ctx, ae)
 }
@@ -962,13 +991,13 @@ func (a *authenticator) refusalEvidence(r *http.Request, ae *AuthError) []Record
 // paths that never reached the operation loop) — in the same shape whether the
 // path wound up admitted or refused.  Only digests travel here; the material
 // stays where it was verified.
-func (a *authenticator) admissionFacts(r *http.Request, ods []OperationDecision) []AdmissionFact {
-	if r == nil {
+func (a *authenticator) admissionFacts(view *RequestView, ods []OperationDecision) []AdmissionFact {
+	if view == nil {
 		return nil
 	}
 	var facts []AdmissionFact
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-		leaf := r.TLS.PeerCertificates[0]
+	if view.PresentedCert != nil {
+		leaf := view.PresentedCert
 		sum := sha256.Sum256(leaf.Raw)
 		facts = append(facts, AdmissionFact{
 			Type:   "client-cert",
@@ -999,7 +1028,7 @@ func (a *authenticator) admissionFacts(r *http.Request, ods []OperationDecision)
 // the facts the deployment supplies for this request.  Anything that is not an
 // explicit "satisfied" refuses, and the refusal carries a challenge — the
 // machine-readable "what is still missing" — built from the requirement result.
-func (a *authenticator) checkEvidenceRequirement(r *http.Request, ac *AuthContext, result *PipelineResult) error {
+func (a *authenticator) checkEvidenceRequirement(view *RequestView, ac *AuthContext, result *PipelineResult) error {
 	req := a.cfg.EvidenceRequirement
 	if req == nil {
 		return nil
@@ -1008,8 +1037,19 @@ func (a *authenticator) checkEvidenceRequirement(r *http.Request, ac *AuthContex
 		return &AuthError{Code: ErrConfig, Status: http.StatusForbidden, Message: "evidence_requirement_invalid: " + err.Error()}
 	}
 	var facts []semantics.EvidenceFact
-	if a.cfg.EvidenceFacts != nil {
+	switch {
+	case view != nil && view.EvidenceFactsWith != nil:
 		var err error
+		facts, err = view.EvidenceFactsWith(ac)
+		if err != nil {
+			return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_facts_unavailable: " + err.Error()}
+		}
+	case a.cfg.EvidenceFacts != nil:
+		var err error
+		var r *http.Request
+		if view != nil {
+			r = view.HTTPAdapter
+		}
 		facts, err = a.cfg.EvidenceFacts(r, ac)
 		if err != nil {
 			return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: "evidence_facts_unavailable: " + err.Error()}
@@ -1028,28 +1068,45 @@ func (a *authenticator) checkEvidenceRequirement(r *http.Request, ac *AuthContex
 		return nil
 	}
 
-	problem, err := evidenceProblem(a.cfg, *req, sat, result, now)
+	problem, err := evidenceProblem(a.cfg, *req, sat, result, now, view)
 	if err != nil {
 		logger := a.log
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.Warn("aic-verifier: evidence challenge build failed", "error", err, "path", r.URL.Path)
+		logger.Warn("aic-verifier: evidence challenge build failed", "error", err, "path", requestPathOf(view))
 	}
 	detail := fmt.Sprintf("evidence %s for requirement %s (missing roles: %v)", sat.Verdict, req.ID, sat.MissingRoles)
 	return &AuthError{Code: ErrDenied, Status: http.StatusForbidden, Message: detail, Problem: problem, Satisfaction: &sat}
 }
 
+// requestPathOf returns the path a refused request was for, for logging when
+// the view was dropped (nil-safe).
+func requestPathOf(view *RequestView) string {
+	if view == nil {
+		return ""
+	}
+	return view.Path
+}
+
 // evidenceProblem turns an unsatisfied requirement into the RFC 9457 carrier,
 // reusing the same challenge shape as the residual-obligation path.
-func evidenceProblem(cfg *Config, req semantics.Requirement, sat semantics.RequirementResult, result *PipelineResult, now time.Time) (*ProblemDetails, error) {
+func evidenceProblem(cfg *Config, req semantics.Requirement, sat semantics.RequirementResult, result *PipelineResult, now time.Time, view *RequestView) (*ProblemDetails, error) {
 	challengeCfg := cfg.Challenges
 	if challengeCfg == nil {
 		return nil, nil
 	}
+	id, err := challengeCfg.newID()
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := challengeCfg.newNonce()
+	if err != nil {
+		return nil, err
+	}
 	params := semantics.ChallengeParams{
-		ID:          challengeCfg.newID(),
-		Nonce:       challengeCfg.newNonce(),
+		ID:          id,
+		Nonce:       nonce,
 		Audience:    challengeCfg.Audience,
 		Now:         now,
 		TTL:         challengeCfg.TTL,
@@ -1075,7 +1132,16 @@ func evidenceProblem(cfg *Config, req semantics.Requirement, sat semantics.Requi
 		}
 		params.ActionDigest = digest
 	} else {
-		params.ActionDigest = semantics.DigestOfCanonical([]byte("admission"))
+		// No operation is constrained: bind the challenge to this request
+		// (method + path) instead of one constant for every request, so a
+		// challenge cannot be presented for a request it was not issued to.
+		// A nil request falls back to the neutral constant (test harnesses
+		// drive the gate without a request).
+		target := []byte("admission")
+		if view != nil {
+			target = []byte(fmt.Sprintf("%s %s", view.Method, view.Path))
+		}
+		params.ActionDigest = semantics.DigestOfCanonical(target)
 	}
 	challenge, err := semantics.BuildChallengeFromRequirement(req, sat, params)
 	if err != nil {

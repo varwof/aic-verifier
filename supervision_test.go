@@ -213,7 +213,7 @@ func TestApprovalPathFailClosed(t *testing.T) {
 
 	// nil requester → fail closed deny(approval_required) + denied event.
 	req := mkRequest()
-	err = a.supervise(req, ac, nil)
+	err = a.supervise(context.Background(), viewFromHTTP(nil, req), ac, nil)
 	var ae *AuthError
 	if !errors.As(err, &ae) || ae.Message != "approval_required" {
 		t.Fatalf("want approval_required deny, got %v", err)
@@ -228,7 +228,7 @@ func TestApprovalPathFailClosed(t *testing.T) {
 	}}
 	cfg.ApprovalRequester = requester
 	req = mkRequest()
-	err = a.supervise(req, ac, nil)
+	err = a.supervise(context.Background(), viewFromHTTP(nil, req), ac, nil)
 	if !errors.As(err, &ae) || ae.Message != "approval_required" {
 		t.Fatalf("want approval_required deny, got %v", err)
 	}
@@ -251,7 +251,7 @@ func TestApprovalPathFailClosed(t *testing.T) {
 	}}
 	cfg.ApprovalRequester = requester2
 	req = mkRequest()
-	if err := a.supervise(req, ac, nil); err != nil {
+	if err := a.supervise(context.Background(), viewFromHTTP(nil, req), ac, nil); err != nil {
 		t.Fatalf("approved request should be admitted, got %v", err)
 	}
 	evs := storeEvents(t, store)
@@ -263,7 +263,7 @@ func TestApprovalPathFailClosed(t *testing.T) {
 	requester3 := &stubRequester{err: errors.New("gateway down")}
 	cfg.ApprovalRequester = requester3
 	req = mkRequest()
-	err = a.supervise(req, ac, nil)
+	err = a.supervise(context.Background(), viewFromHTTP(nil, req), ac, nil)
 	if !errors.As(err, &ae) || ae.Message != "approval_required" {
 		t.Fatalf("want approval_required deny on error, got %v", err)
 	}
@@ -274,7 +274,7 @@ func TestApprovalPathFailClosed(t *testing.T) {
 	// RequireApproval==nil → no requester consultation, no events.
 	cfg.RequireApproval = nil
 	requester3.called = false
-	if err := a.supervise(mkRequest(), ac, nil); err != nil {
+	if err := a.supervise(context.Background(), viewFromHTTP(nil, mkRequest()), ac, nil); err != nil {
 		t.Fatalf("no hook should admit directly, got %v", err)
 	}
 	if requester3.called {

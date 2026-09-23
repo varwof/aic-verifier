@@ -12,7 +12,7 @@ back as evidence.
 | `curl` | any client that can present a client certificate works |
 | free ports | **9444** (demo proxy), **9081** (demo backend, started by the same process), **9443** (the evidence demo in step 5) |
 
-Dependencies are fetched by `go run` itself: `varwof/register v0.3.0` (the CLC
+Dependencies are fetched by `go run` itself: `varwof/register v0.6.0` (the CLC
 evaluator and record format), `varwof/types v0.6.0` (AIC structures) and
 `varwof/pkcs7 v0.1.0`. No CRL/OCSP responder, timestamp authority or database is
 needed for this walkthrough.
@@ -127,7 +127,7 @@ go run ./examples/inspect-record records/smoke-verify-d355cc50...json
 ```
 
 ```
-language   clc-v1 (CLC-1.5)
+language   clc-v1 (CLC-1.8)
 operation  demo/example-v1:api:read
 verdict    allow
 inputs     sha-256:01XMUHOFFVE76Rc4NIn2IZnL_m0wyLyDt6pyWYvmvOE
@@ -157,4 +157,4 @@ go run ./cmd/record -verify records/smoke-verify-9f13afb2...json
 - **Who issued a record.** `EvidenceConfig.Sign` + `KeyID` sign every envelope;
   `VerifyEvidenceDir` checks a whole directory and reports gaps.
 - **Every configuration field**: [api.md](api.md).
-- **Why the layering is what it is**: [DESIGN.md](DESIGN.md).
+- **Why the layering is what it is**: [architecture.md](architecture.md).

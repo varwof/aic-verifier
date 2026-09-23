@@ -37,7 +37,7 @@ const sqlQueryCap = "std/database-v1:query:SELECT"
 // database capability and (optionally) a time-window authorization
 // constraint.  The admission pipeline does not cryptographically verify the
 // signer, so a self-signed leaf is sufficient for decision tests.
-func testAICCert(t *testing.T, withWindow bool) *x509.Certificate {
+func testAICCert(t testing.TB, withWindow bool) *x509.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

@@ -133,6 +133,11 @@ type AdmissionConfig struct {
 	// fail-closed. Default false only logs audit warnings for unknown constraints and ignores them
 	// (forward compatible, strict mode).
 	StrictConstraints bool
+	// ConstraintRegistry selects the constraint evaluator registry this
+	// admission uses.  nil falls back to the package-global registry
+	// (RegisterConstraint), so one process can host several gateways with
+	// distinct constraint sets via per-Config registries.
+	ConstraintRegistry *ConstraintRegistry
 	// ClientIP is used for authorizationConstraints allowed-cidr checks.
 	ClientIP string
 	// AuditLogger is used for authorization decision audit logging. When non-nil, logs warnings
@@ -237,15 +242,21 @@ func CheckAuthorizationConstraintsAt(constraints []Capability, clientIP, timeHHM
 	return checkConstraintsAt(constraints, clientIP, now)
 }
 
-// checkConstraintsAt evaluates authorizationConstraints one by one through the constraint registry.
+// checkConstraintsAt evaluates authorizationConstraints one by one through the global constraint registry.
 // Only processes constraint / constraint-v1 scheme entries; other schemes are skipped as business capabilities.
 func checkConstraintsAt(constraints []Capability, clientIP string, now time.Time) error {
+	return checkConstraintsReg(globalConstraintRegistry, constraints, clientIP, now)
+}
+
+// checkConstraintsReg evaluates authorizationConstraints one by one through the given constraint
+// registry (per-deployment when non-nil; the caller is responsible for picking the default).
+func checkConstraintsReg(reg *ConstraintRegistry, constraints []Capability, clientIP string, now time.Time) error {
 	ctx := &ConstraintContext{ClientIP: clientIP, Now: now}
 	for _, c := range constraints {
 		if !isConstraintScheme(c.SchemeId) {
 			continue
 		}
-		ev, err := globalConstraintRegistry.Find(c.CapabilityId)
+		ev, err := reg.Find(c.CapabilityId)
 		if err != nil {
 			// Unknown constraint type: ignored (forward compatible), caller logs audit warning.
 			// Will be recognized and executed after registering the corresponding executor.
@@ -258,21 +269,33 @@ func checkConstraintsAt(constraints []Capability, clientIP string, now time.Time
 	return nil
 }
 
-// isKnownConstraintType determines whether a capabilityId is a registered constraint type.
+// isKnownConstraintType determines whether a capabilityId is a registered constraint type
+// in the global registry.
 func isKnownConstraintType(capabilityId string) bool {
-	_, err := globalConstraintRegistry.Find(capabilityId)
+	return isKnownConstraintTypeReg(globalConstraintRegistry, capabilityId)
+}
+
+// isKnownConstraintTypeReg is the registry-parameterized form of isKnownConstraintType.
+func isKnownConstraintTypeReg(reg *ConstraintRegistry, capabilityId string) bool {
+	_, err := reg.Find(capabilityId)
 	return err == nil
 }
 
 // firstUnknownConstraint returns the first unregistered constraint entry from constraints
-// (scheme ∈ {constraint, constraint-v1} with unregistered capabilityId). Returns nil if none found.
+// (scheme ∈ {constraint, constraint-v1} with unregistered capabilityId), resolved against the
+// global registry. Returns nil if none found.
 func firstUnknownConstraint(constraints []Capability) *Capability {
+	return firstUnknownConstraintReg(globalConstraintRegistry, constraints)
+}
+
+// firstUnknownConstraintReg is the registry-parameterized form of firstUnknownConstraint.
+func firstUnknownConstraintReg(reg *ConstraintRegistry, constraints []Capability) *Capability {
 	for i := range constraints {
 		c := &constraints[i]
 		if !isConstraintScheme(c.SchemeId) {
 			continue
 		}
-		if !isKnownConstraintType(c.CapabilityId) {
+		if !isKnownConstraintTypeReg(reg, c.CapabilityId) {
 			return c
 		}
 	}
@@ -351,6 +374,15 @@ func parseTimeParts(s string) (int, int, bool) {
 		return 0, 0, false
 	}
 	return h, m, true
+}
+
+// admissionConstraintRegistry selects the constraint registry for an admission:
+// the per-Config registry when set, otherwise the package-global one.
+func admissionConstraintRegistry(cfg AdmissionConfig) *ConstraintRegistry {
+	if cfg.ConstraintRegistry != nil {
+		return cfg.ConstraintRegistry
+	}
+	return globalConstraintRegistry
 }
 
 // CheckAdmission performs the complete connection admission check:
@@ -454,12 +486,12 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 	// PA-level constraint checks (independent of AIC constraints; PA and AIC are checked separately at different layers)
 	// Direct authorization (no AIC): PA constraints are the only constraints; in delegation, PA and AIC constraints are checked independently
 	if cfg.EnforceConstraints && result.PrincipalAuthorization != nil && len(result.PrincipalAuthorization.AuthorizationConstraints) > 0 {
-		if err := CheckAuthorizationConstraints(result.PrincipalAuthorization.AuthorizationConstraints, cfg.ClientIP); err != nil {
+		if err := checkConstraintsReg(admissionConstraintRegistry(cfg), result.PrincipalAuthorization.AuthorizationConstraints, cfg.ClientIP, time.Now().In(time.UTC)); err != nil {
 			return AdmissionResult{Decision: DecisionDeny, Reason: fmt.Sprintf("pa constraint: %v", err)}
 		}
 		// Strict mode: unknown PA constraint type fail-closed.
 		if cfg.StrictConstraints {
-			if u := firstUnknownConstraint(result.PrincipalAuthorization.AuthorizationConstraints); u != nil {
+			if u := firstUnknownConstraintReg(admissionConstraintRegistry(cfg), result.PrincipalAuthorization.AuthorizationConstraints); u != nil {
 				return AdmissionResult{
 					Decision: DecisionDeny,
 					Reason:   fmt.Sprintf("pa constraint: unknown constraint type %q (strict mode)", u.CapabilityId),
@@ -472,20 +504,20 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 	if aic != nil && cfg.EnforceConstraints && len(aic.AuthorizationConstraints) > 0 {
 		// Strict mode priority: unknown constraint type fail-closed.
 		if cfg.StrictConstraints {
-			if u := firstUnknownConstraint(aic.AuthorizationConstraints); u != nil {
+			if u := firstUnknownConstraintReg(admissionConstraintRegistry(cfg), aic.AuthorizationConstraints); u != nil {
 				return AdmissionResult{
 					Decision: DecisionDeny,
 					Reason:   fmt.Sprintf("aic constraint: unknown constraint type %q (strict mode)", u.CapabilityId),
 				}
 			}
 		}
-		if err := CheckAuthorizationConstraints(aic.AuthorizationConstraints, cfg.ClientIP); err != nil {
+		if err := checkConstraintsReg(admissionConstraintRegistry(cfg), aic.AuthorizationConstraints, cfg.ClientIP, time.Now().In(time.UTC)); err != nil {
 			return AdmissionResult{Decision: DecisionDeny, Reason: err.Error()}
 		}
 		// Log unknown constraint type audit warning (forward compatible: does not block business)
 		if cfg.AuditLogger != nil {
 			for _, c := range aic.AuthorizationConstraints {
-				if !isKnownConstraintType(c.CapabilityId) {
+				if !isKnownConstraintTypeReg(admissionConstraintRegistry(cfg), c.CapabilityId) {
 					cfg.AuditLogger.Log(AuditEntry{
 						Action:   string(ActionUnknownConstraint),
 						TargetID: c.CapabilityId,

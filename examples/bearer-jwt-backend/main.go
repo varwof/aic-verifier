@@ -23,7 +23,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -36,18 +36,27 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":9443", "aic-verifier proxy listen address")
-	backend := flag.String("backend", "http://127.0.0.1:9080", "backend real API base URL")
-	serveBackend := flag.Bool("serve-backend", true, "start the sample backend on :9080")
-	denyRisk := flag.Bool("deny-risk", false, "DemoApprover denies every transfer (demonstrates the deny(approval_required) audit path)")
-	auditFile := flag.String("audit-file", "", "audit JSON Lines file read by the evidence exporter")
-	supervisionLog := flag.String("supervision-log", "", "supervision event JSON Lines file")
-	tsaURL := flag.String("tsa-url", "", "RFC 3161 timestamping URL for audit + supervision events")
-	flag.Parse()
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("bearer-jwt-backend", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addr := fs.String("addr", ":9443", "aic-verifier proxy listen address")
+	backend := fs.String("backend", "http://127.0.0.1:9080", "backend real API base URL")
+	serveBackend := fs.Bool("serve-backend", true, "start the sample backend on :9080")
+	denyRisk := fs.Bool("deny-risk", false, "DemoApprover denies every transfer (demonstrates the deny(approval_required) audit path)")
+	auditFile := fs.String("audit-file", "", "audit JSON Lines file read by the evidence exporter")
+	supervisionLog := fs.String("supervision-log", "", "supervision event JSON Lines file")
+	tsaURL := fs.String("tsa-url", "", "RFC 3161 timestamping URL for audit + supervision events")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	target, err := url.Parse(*backend)
 	if err != nil {
-		log.Fatal("bad backend:", err)
+		fmt.Fprintln(stderr, "bad backend:", err)
+		return 1
 	}
 
 	conf := &aicverifier.Config{
@@ -71,20 +80,38 @@ func main() {
 		SupervisionLog: *supervisionLog,
 		TSAURL:         *tsaURL,
 	}); err != nil {
-		log.Fatal("supervision demo:", err)
+		fmt.Fprintln(stderr, "supervision demo:", err)
+		return 1
 	}
 
 	if err := ensureServerTLS(conf.TLSCertFile, conf.TLSKeyFile); err != nil {
-		log.Fatal("tls:", err)
+		fmt.Fprintln(stderr, "tls:", err)
+		return 1
 	}
 
 	if *serveBackend {
 		go startBackend(":9080", conf.EvidenceExporter)
 	}
 
-	// The high-risk transfer route comes FIRST so matchRoute picks it over the
-	// /api prefix when path starts with /api/transfer.
-	server, err := aicverifier.NewServer(conf, []aicverifier.Route{
+	server, err := buildServer(conf, target)
+	if err != nil {
+		fmt.Fprintln(stderr, "aic-verifier server:", err)
+		return 1
+	}
+
+	fmt.Fprintf(stderr, "AIC-protected proxy listening on %s -> backend %s\n", *addr, *backend)
+	if err := server.ListenAndServe(*addr); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+// buildServer assembles the AIC-protected reverse proxy around the shared
+// route table: the high-risk transfer route comes FIRST so matchRoute picks it
+// over the /api prefix when path starts with /api/transfer.
+func buildServer(conf *aicverifier.Config, target *url.URL) (*aicverifier.Server, error) {
+	return aicverifier.NewServer(conf, []aicverifier.Route{
 		{
 			Path:                 superv.TransferPath,
 			Target:               target,
@@ -96,20 +123,22 @@ func main() {
 			RequiredCapabilities: []string{"api:read"},
 		},
 	})
-	if err != nil {
-		log.Fatal("aic-verifier server:", err)
-	}
-
-	log.Printf("AIC-protected proxy listening on %s -> backend %s", *addr, *backend)
-	if err := server.ListenAndServe(*addr); err != nil {
-		log.Fatal(err)
-	}
 }
 
 // startBackend serves the sample backend together with the /evidence demo
 // endpoint, which exports the evidence bundle for a given operation id (the
 // same process that runs the proxy; not a public Server route).
 func startBackend(addr string, exporter aicverifier.EvidenceExporter) {
+	srv := &http.Server{Addr: addr, Handler: backendMux(exporter)}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintln(os.Stderr, "backend:", err)
+	}
+}
+
+// backendMux builds the sample backend handler: the identity-echoing /api
+// routes and, when an evidence exporter is available, the /evidence demo
+// endpoint that exports the evidence bundle for a given operation id.
+func backendMux(exporter aicverifier.EvidenceExporter) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
 		ident := map[string]string{}
@@ -148,10 +177,7 @@ func startBackend(addr string, exporter aicverifier.EvidenceExporter) {
 			_ = json.NewEncoder(w).Encode(bundle)
 		})
 	}
-	srv := &http.Server{Addr: addr, Handler: mux}
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintln(os.Stderr, "backend:", err)
-	}
+	return mux
 }
 
 // ensureServerTLS writes a self-signed server certificate (SAN: localhost)

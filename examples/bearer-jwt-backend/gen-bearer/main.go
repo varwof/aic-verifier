@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"time"
@@ -33,28 +34,36 @@ const (
 )
 
 func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run implements the command so its failure paths are coverable without
+// exiting the test process. Exit codes: 1 CA/TLS pair generation failed, 2 CA
+// pair unreadable, 3 token signing failed.
+func run(args []string, stdout, stderr io.Writer) int {
 	if err := ensureCA(); err != nil {
-		fmt.Fprintln(os.Stderr, "gen-bearer:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "gen-bearer:", err)
+		return 1
 	}
 
 	if err := ensureTLSPair(); err != nil {
-		fmt.Fprintln(os.Stderr, "gen-bearer:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "gen-bearer:", err)
+		return 1
 	}
 
 	ca, err := readCAPair(caCert, caKey)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gen-bearer:", err)
-		os.Exit(2)
+		fmt.Fprintln(stderr, "gen-bearer:", err)
+		return 2
 	}
 
 	token, err := signAICJWT(ca)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gen-bearer:", err)
-		os.Exit(3)
+		fmt.Fprintln(stderr, "gen-bearer:", err)
+		return 3
 	}
-	fmt.Println(token)
+	fmt.Fprintln(stdout, token)
+	return 0
 }
 
 type caPair struct {

@@ -288,6 +288,18 @@ func (c *OCSPCache) fallbackErr(cert *x509.Certificate, format string, args ...i
 	}
 	switch c.fallback {
 	case OCSPFallbackAllow:
+		// C3 risk: this path silently treats a certificate whose revocation
+		// status could not be proven (no OCSP URL, unreachable responder,
+		// unparseable/stale response, missing issuer) as VALID — a revoked
+		// certificate is admitted without any revocation check. Only tolerable
+		// when the deployment explicitly accepts that trust-model tradeoff;
+		// "deny"/"crl" fail closed. Log every such allowance at ERROR level so
+		// operators can detect when the fallback is doing the heavy lifting.
+		label := "unknown-certificate"
+		if cert != nil {
+			label = cert.Subject.CommonName
+		}
+		fmt.Printf("[ERROR] OCSP fallback_allow: ALLOWING certificate %s without revocation proof: %s\n", label, msg)
 		fmt.Printf(t(c.lang, "ocsp.fallback_allow")+"\n", msg)
 		return nil
 	case OCSPFallbackCRL:

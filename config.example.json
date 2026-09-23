@@ -36,7 +36,7 @@
     "require_evidence_export": true
   },
 
-  "audit_log_file": "/var/log/aic-verifier-audit.jsonl",
+  "audit_log_file": "aic-verifier-audit.jsonl",
   "audit_tsa_url": "https://tsa.example.com/rfc3161",
-  "supervision_log_file": "/var/log/aic-verifier-supervision.jsonl"
+  "supervision_log_file": "aic-verifier-supervision.jsonl"
 }

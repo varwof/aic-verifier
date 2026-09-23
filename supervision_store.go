@@ -93,6 +93,11 @@ func (s *SupervisionStore) Record(ev *pki.SupervisionEvent) error {
 		tst, err := s.tsa.Sign(evJSON)
 		if err == nil {
 			signed.TST = EncodeBase64(tst)
+		} else {
+			// L2: a TSA attestation failure previously recorded the event
+			// unsigned in silence, so operators would never notice the
+			// supervision chain had lost its tamper-evidence coverage.
+			fmt.Printf("supervision_store: WARNING TSA signing failed for operation %q (event recorded unsigned): %v\n", ev.OperationID, err)
 		}
 	}
 	data, err := json.Marshal(signed)
@@ -109,13 +114,18 @@ func (s *SupervisionStore) Record(ev *pki.SupervisionEvent) error {
 	return nil
 }
 
-// Close closes the store file.  Further Record calls fail.
+// Close closes the store file.  Further Record calls fail.  It is idempotent:
+// a second Close returns nil instead of re-closing the file (which would return
+// "file already closed" and make Config.Close non-idempotent).
 func (s *SupervisionStore) Close() error {
 	if s == nil || s.w == nil {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
 	s.closed = true
 	return s.w.Close()
 }
@@ -130,7 +140,13 @@ func (s *SupervisionStore) Query(filter SupervisionQuery) ([]pki.SupervisionEven
 	if s.file == "" {
 		return nil, fmt.Errorf("supervision_store: no file configured")
 	}
-	f, err := os.Open(s.file)
+	// H5: snapshot the current file path under the mutex, then read it after
+	// releasing the lock so a concurrent rotation/close does not corrupt the
+	// read (and Query never blocks Record on the write path).
+	s.mu.Lock()
+	file := s.file
+	s.mu.Unlock()
+	f, err := os.Open(file)
 	if err != nil {
 		return nil, err
 	}

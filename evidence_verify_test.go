@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,9 +24,12 @@ func TestVerifyEvidenceDirReportsGaps(t *testing.T) {
 
 	t.Run("good", func(t *testing.T) {
 		dir := t.TempDir()
+		// The outcome must point at a decision record that is present in the
+		// same directory: its digest is the linkage the outcome rides on.
 		writeEnvFile(t, dir, "decision.json", signedDecisionEnvelope(t, sign))
 		writeEnvFile(t, dir, "admission.json", signedAdmissionEnvelope(sign))
-		writeEnvFile(t, dir, "outcome.json", signedOutcomeEnvelope(sign))
+		decisionDigest := decisionDigestOf(t, filepath.Join(dir, "decision.json"))
+		writeEnvFile(t, dir, "outcome.json", signedOutcomeEnvelope(sign, decisionDigest))
 
 		rep, err := VerifyEvidenceDir(dir, verify)
 		if err != nil {
@@ -33,6 +37,9 @@ func TestVerifyEvidenceDirReportsGaps(t *testing.T) {
 		}
 		if rep.Total != 3 || rep.Decision != 1 || rep.Admission != 1 || rep.Outcome != 1 {
 			t.Errorf("report = %+v, want 3 records (1 per kind)", rep)
+		}
+		if rep.OrphanOutcome != 0 {
+			t.Errorf("orphan outcomes = %d, want 0", rep.OrphanOutcome)
 		}
 		if len(rep.Failures) != 0 {
 			t.Errorf("failures = %+v, want none", rep.Failures)
@@ -50,7 +57,7 @@ func TestVerifyEvidenceDirReportsGaps(t *testing.T) {
 		writeEnvFile(t, dir, "admission-tampered.json", badSig)
 
 		// Unsigned record: fine without a verifier, a gap when one is required.
-		unsigned := signedOutcomeEnvelope(sign)
+		unsigned := signedOutcomeEnvelope(sign, "ab")
 		unsigned.Signatures = nil
 		writeEnvFile(t, dir, "outcome-unsigned.json", unsigned)
 
@@ -72,6 +79,35 @@ func TestVerifyEvidenceDirReportsGaps(t *testing.T) {
 		}
 		if len(rep.Failures) != 3 {
 			t.Errorf("failures = %+v, want the tampered, unsigned and garbage files", rep.Failures)
+		}
+	})
+
+	t.Run("orphan-outcome", func(t *testing.T) {
+		dir := t.TempDir()
+		writeEnvFile(t, dir, "decision.json", signedDecisionEnvelope(t, sign))
+		writeEnvFile(t, dir, "admission.json", signedAdmissionEnvelope(sign))
+		// An outcome whose decisionDigest is empty or does not resolve to a
+		// decision in the set is a linkage gap, not consent (P3-gap2): it must
+		// move out of the Outcome count and into the orphan/gap report.
+		writeEnvFile(t, dir, "outcome-orphan.json", signedOutcomeEnvelope(sign, "ab"))
+		decisionDigest := decisionDigestOf(t, filepath.Join(dir, "decision.json"))
+		writeEnvFile(t, dir, "outcome-swapped.json", signedOutcomeEnvelope(sign, "deadbeef"))
+		writeEnvFile(t, dir, "outcome-linked.json", signedOutcomeEnvelope(sign, decisionDigest))
+
+		rep, err := VerifyEvidenceDir(dir, verify)
+		if err != nil {
+			t.Fatalf("VerifyEvidenceDir: %v", err)
+		}
+		if rep.Outcome != 1 || rep.OrphanOutcome != 2 {
+			t.Errorf("report = %+v, want 1 linked + 2 orphan outcomes", rep)
+		}
+		if len(rep.Failures) != 2 {
+			t.Fatalf("failures = %+v, want the two orphan outcomes listed", rep.Failures)
+		}
+		for _, f := range rep.Failures {
+			if !strings.Contains(f.Reason, "does not resolve") {
+				t.Errorf("failure %+v: want an unresolved-linkage reason", f)
+			}
 		}
 	})
 
@@ -138,6 +174,17 @@ func writeEnvFile(t *testing.T, dir, name string, env semantics.Envelope) {
 	}
 }
 
+// decisionDigestOf reads the input digest a decision record's outcome must
+// point back at.
+func decisionDigestOf(t *testing.T, path string) string {
+	t.Helper()
+	rec, err := LoadEvidenceRecord(path)
+	if err != nil {
+		t.Fatalf("load decision %s: %v", path, err)
+	}
+	return hexOf(rec.InputDigest.Value)
+}
+
 func signedDecisionEnvelope(t *testing.T, sign func([]byte) ([]byte, error)) semantics.Envelope {
 	t.Helper()
 	cert := testAICCert(t, false)
@@ -176,8 +223,8 @@ func signedAdmissionEnvelope(sign func([]byte) ([]byte, error)) semantics.Envelo
 	return env
 }
 
-func signedOutcomeEnvelope(sign func([]byte) ([]byte, error)) semantics.Envelope {
-	rec := OutcomeRecord{Ver: OutcomeRecordVersion, Outcome: OutcomeObserved, At: time.Now().UTC(), StatusCode: 200, DecisionDigest: "ab"}
+func signedOutcomeEnvelope(sign func([]byte) ([]byte, error), decisionDigest string) semantics.Envelope {
+	rec := OutcomeRecord{Ver: OutcomeRecordVersion, Outcome: OutcomeObserved, At: time.Now().UTC(), StatusCode: 200, DecisionDigest: decisionDigest}
 	env, err := NewOutcomeEnvelope(rec)
 	if err != nil {
 		panic(err)

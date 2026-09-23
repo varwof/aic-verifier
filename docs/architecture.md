@@ -1,9 +1,42 @@
-# aic-verifier design
+# aic-verifier architecture
 
 `aic-verifier` is the service side of AIC (Agent Identity Certificate)
 authorization over HTTP, packaged as a standalone library. Its admission
 engine is extracted from the varwof gateway-core so a plain API service can
 enforce AIC without running a gateway.
+
+## Where this fits
+
+```
+ protocol carriers                        admission core                        effects
+ ────────────────                          ──────────────                        ───────
+ HttpClient / compiler produced           aicverifier.RunAccessPipeline         HTTP middleware
+   mTLS client cert            ──▶    chain→CRL/OCSP→roles→AIC→CLC         ──▶   handler / backend
+   Authorization: Bearer AIC-JWT        capability ∩ PA constraints                  │
+   (RATS §10 decision context)                  │  verdict                        evidence:
+                                                                                decision/admission/
+       peer (any carrier)                            │                          outcome records + DSSE
+   gRPC carrier (NewDecisionServer)       CLC decision (semantics)                    │
+   queue / in-process Decide()          allow/allow_unresolved/deny             audit (merkle) + supervision
+```
+
+`aic-verifier` is a **library**: it does not own the network listener, the
+certificate minting, or the policy authoring tool. It owns the decision and the
+records. The repo layout mirrors that:
+
+| Area | Files |
+|---|---|
+| AuthN entry (HTTP) | `aicverifier.go` (`Authenticate`, `Handler`) |
+| Admission pipeline | `config.go`, `clc.go`, `decision.go`, `delegation_chain.go`, `constraints.go` |
+| Revocation & freshness | `crl.go`, `ocsp.go`, `nonce_cache.go`, `jwt.go` |
+| Identity propagation | `identity.go` |
+| Evidence | `evidence*.go`, `admission_record.go`, `evidence_sink.go`, `evidence_verify.go`, `evidence_profile.go`, `evidence_signing.go` |
+| Challenge / refusal shape | `challenge.go` (`CLC-CHALLENGE-v1`) |
+| DecisionServer (transport-independent) | `decide.go`, `admin.go` |
+| Audit & supervision | `audit.go`, `merkle.go`, `supervision.go` |
+| Reverse proxy | `server.go` (routes, `X-AIC-*`, outcome reporting) |
+| gRPC binding | `grpc/` (subpackage, imports `google.golang.org/grpc`) |
+| MCP admin panel | `mcp/` (subpackage, imports `mark3labs/mcp-go`) |
 
 ## Trust model
 
@@ -14,13 +47,13 @@ A service operator configures the CAs it trusts:
 - `CACertFile` (for mTLS): the CA that issues client certificates. Client
   certificates must chain to this CA and carry the AIC X.509 extension.
 
-Two modes (`AuthMode`):
+Three modes (`AuthMode`):
 
 - `BearerOnly`: an `Authorization: Bearer <AIC-JWT>` header is required and
   verified against `JWTCAFile`.
 - `MTLSOnly`: a validated mTLS client certificate is required.
-- `Mutual`: either credential admits; the pipeline evaluates whichever is
-  presented (mTLS chain wins when both are present).
+- `MTLSOrBearer` (default): either credential admits; the pipeline evaluates
+  whichever is presented (mTLS chain wins when both are present).
 
 ## Admission pipeline
 
@@ -116,3 +149,57 @@ trusted for backend calls.
 All of the above can be set from a single JSON file (`config.example.json`):
 listener timeouts, log file, TLS/mTLS files, JWT policy, auth/identity modes,
 and admission policy. Unknown fields are rejected so typos surface as errors.
+
+## Request flow (middleware style)
+
+```
+ client request
+   │
+   ▼
+ middleware handler ── tls.ValidClientCertPair (earliest TLS validation)
+   │
+   ├─ bearer?   Authenticate reads Authorization: Bearer <aic+jwt>
+   │            kid→SPKI→JWTCAFile; jti single-use (ReplayProtection); cnf.jkt
+   ├─ mtls?     peer cert chain → buildChain (CACertFile) → CRL/OCSP → roles/SPIFFE
+   │
+   ▼
+ RunAccessPipeline: chain → CRL/OCSP → RBAC → AIC decision → CLC capability ∩ PA
+   │            → parameter bounds →  verdict
+   │
+   ├─ deny ──▶ AuthError (JSON) or application/problem+json (RFC 9457, challenge)
+   │              admission record / CLC decision record already emitted
+   │
+   ├─ allow_unresolved ──▶ DischargeObligations ? evaluate : refuse (never silent allow)
+   │
+   ▼
+ allow: inject X-AIC-* (proxy) / AuthContext on context (middleware)
+   │
+   ├─ handler runs ──▶ (EmitOutcome) middleware probes status → outcome record
+   │
+   ▼
+ response → auth audit log (optional, TSA-signed) 
+```
+
+## Reverse-proxy style
+
+`NewServer(cfg, routes)` builds one `http.Server`; every request goes through
+the same middleware (so outcomes are emitted once), then a route match
+(`Route.Path` prefix) schedules forwarding. The proxy strips client-supplied
+`X-AIC-*` / `Authorization` / `Proxy-Authorization` headers before injecting
+its own and contacting the backend; `BackendRootCA` pins HTTPS backends.
+Transport failures are reported as `OutcomeIndeterminate` (never a forged 502
+outcome).
+
+## Transport-independent decisions
+
+`NewDecisionServer(cfg)` exposes the same admission on `Decide(ctx, view)`,
+`Health`, gRPC (`Verify`/`Decide`), and `AdminHandler` surfaces, so HTTP, gRPC,
+queue and in-process carriers agree on the identical decision for one `Config`.
+`ReloadPolicy` swaps the authorization policy at runtime.
+
+## Read the SDK in this order
+
+`config.go` (surface) → `aicverifier.go` (entry) → `decision.go` / `clc.go`
+(core semantics) → `evidence*.go` (records) → `challenge.go` (refusal shape) →
+`server.go` (proxy) → `decide.go`/`admin.go` (transport-independent core) →
+`grpc/` & `mcp/` (wire bindings).

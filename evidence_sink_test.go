@@ -114,6 +114,55 @@ func TestEvidenceDisabledEmitsNothing(t *testing.T) {
 	}
 }
 
+// TestNoTTLStillBindsUniqueDigest: 决策记录在每个准入里都绑上唯一的 instance 值
+// （newEvidenceNonce），TTL 缺省（0）也一样 —— 两次逐字相同的请求产生两个不同的
+// input digest，而不是命中同一个通配 digest。这让 outcome 的 decisionDigest 精确指向
+// 一次执行，杜绝零 TTL 下把两个相同请求的记录混为一条（P3-gap3）。
+func TestNoTTLStillBindsUniqueDigest(t *testing.T) {
+	cert := testAICCert(t, false)
+	res := CheckAdmission(cert, B2Config(Operation{ID: sqlQueryCap, Params: map[string]any{"limit": 5}}))
+
+	emit := func() []RecordRef {
+		dir := t.TempDir()
+		cfg := &EvidenceConfig{Sink: &FileSink{Dir: dir}, RecorderID: "pep-ttl0"}
+		refs, err := EmitDecisionRecords(cfg, EvidenceContext{Outcome: EvidenceAdmitted}, cert, res.AIC, res.PrincipalAuthorization, nil, res.OperationDecisions)
+		if err != nil {
+			t.Fatalf("EmitDecisionRecords: %v", err)
+		}
+		return refs
+	}
+
+	first := emit()
+	second := emit()
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatal("no decision records emitted")
+	}
+	if first[0].Digest == second[0].Digest {
+		t.Errorf("two identical admissions share digest %q: per-instance nonce is not bound", first[0].Digest)
+	}
+
+	// The nonce rides in the record's DecisionContext and reproduces on Verify:
+	// the record stays self-consistent even with TTL zero.
+	raw, err := os.ReadFile(first[0].Path)
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	var env semantics.Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode record: %v", err)
+	}
+	rec, err := env.DecisionRecord()
+	if err != nil {
+		t.Fatalf("decision record: %v", err)
+	}
+	if rec.Inputs.Context == nil || rec.Inputs.Context.Nonce == "" {
+		t.Errorf("record carries no per-instance nonce context")
+	}
+	if err := rec.Verify(); err != nil {
+		t.Errorf("record does not reproduce: %v", err)
+	}
+}
+
 func TestEvidenceStrictModeSurfacesSinkFailure(t *testing.T) {
 	cert := testAICCert(t, false)
 	res := CheckAdmission(cert, B2Config(Operation{ID: sqlQueryCap, Params: map[string]any{"limit": 5}}))

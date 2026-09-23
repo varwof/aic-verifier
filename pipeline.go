@@ -112,6 +112,13 @@ type PipelineConfig struct {
 	EnforceConstraints bool
 	// StrictConstraints, when true, fails-closed on unknown constraint types.
 	StrictConstraints bool
+	// AuthorizationPolicy, when non-nil, selects the OU→role mapping this
+	// pipeline uses instead of the package-global policy.  nil falls back to
+	// SetAuthorizationPolicy's global.
+	AuthorizationPolicy *AuthorizationPolicy
+	// ConstraintRegistry, when non-nil, selects the constraint evaluator
+	// registry this pipeline uses instead of the package-global registry.
+	ConstraintRegistry *ConstraintRegistry
 	// ParameterValidators is the parameter boundary validator registry.
 	// When non-nil, after the P∩C intersection, parameters of AIC declarations and PA
 	// authorizations are compared one by one against the boundary; out-of-bounds → reject.
@@ -238,7 +245,7 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		}
 	}
 
-	roles := ExtractPolicyRoles(clientCert)
+	roles := extractPolicyRoles(clientCert, cfg.AuthorizationPolicy)
 	if len(cfg.AllowRoles) > 0 {
 		if !CheckRole(roles, cfg.AllowRoles) {
 			return deny(fmt.Sprintf("insufficient roles: have %v, need %v", roles, cfg.AllowRoles))
@@ -310,6 +317,7 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		ClientIP:                    cfg.ClientIP,
 		EnforceConstraints:          cfg.EnforceConstraints,
 		StrictConstraints:           cfg.StrictConstraints,
+		ConstraintRegistry:          cfg.ConstraintRegistry,
 		AuditLogger:                 cfg.AuditLogger,
 		CredentialBundle:            cfg.CredentialBundle,
 	})

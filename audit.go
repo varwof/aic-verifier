@@ -147,9 +147,16 @@ func (r *RotatingFile) rotate() error {
 		if i == 1 {
 			prev = r.path
 		}
-		os.Remove(old)
+		if err := os.Remove(old); err != nil && !os.IsNotExist(err) {
+			// L1: a leftover backup must not be silently ignored — it can
+			// shadow the rotation or exhaust disk without anyone noticing.
+			fmt.Printf("audit: rotate remove %s: %v\n", old, err)
+		}
 		if _, err := os.Stat(prev); err == nil {
-			os.Rename(prev, old)
+			if err := os.Rename(prev, old); err != nil {
+				// L1: the rename is the rotation's critical step; surface it.
+				fmt.Printf("audit: rotate rename %s -> %s: %v\n", prev, old, err)
+			}
 		}
 	}
 
@@ -329,18 +336,16 @@ func (l *AuditLogger) Close() error {
 	l.mu.Unlock()
 
 	l.stopped.Store(true)
-	// Drain any buffered entries before closing the channel so pending audit
-	// records are not silently lost (M6).
-	for {
-		select {
-		case entry := <-l.entries:
-			l.logSync(entry)
-		default:
-			close(l.entries)
-			<-l.done
-			return l.w.Close()
-		}
-	}
+	// Stop accepting new entries and let the single consumer goroutine drain
+	// the buffer to completion before closing the file. Draining from Close as
+	// well would create a second consumer on the same channel and reorder
+	// entries (both goroutines racing to dequeue); ranging over the closed
+	// channel keeps the write order identical to the enqueue order. A Log that
+	// races past the stopped check and sends on the closed channel panics; Log
+	// recovers that panic by design.
+	close(l.entries)
+	<-l.done
+	return l.w.Close()
 }
 
 // AuditVerifier verifies audit log entries via TSA timestamps.

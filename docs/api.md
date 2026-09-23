@@ -116,7 +116,7 @@ refusal itself produced, so a caller can log or forward them next to the answer.
 type EvidenceConfig struct {
     Sink       EvidenceSink            // nil → SlogSink with the SDK logger
     Strict     bool                    // emission failure denies the request
-    TTL        time.Duration           // pins a freshness context on the record
+    TTL        time.Duration           // RATS §10 clock on the record; the per-admission nonce (RATS §10.2) is bound regardless
     Audience   string                  // relying party the evidence is addressed to
     RecorderID string                  // which admission point emitted it
     Now        func() time.Time
@@ -124,7 +124,7 @@ type EvidenceConfig struct {
     Gaps       *GapCounter             // counts emissions that left no record
     Sign       func(pae []byte) ([]byte, error)
     KeyID      string
-    EmitOutcome bool                   // proxy reports what the effect boundary saw
+    EmitOutcome bool                   // middleware + reverse proxy report what the effect boundary saw
     // Profile, Requirement, ... see go doc
 }
 ```
@@ -146,7 +146,7 @@ Reading records back:
 |---|---|
 | `LoadEvidenceRecord(path)` | one file → re-computed `*semantics.DecisionRecord` |
 | `CheckEvidenceEnvelope(env)` | validate either payload type through one entry point |
-| `VerifyEvidenceDir(dir, verifyFn)` | whole directory; per-file failures are collected, not fatal |
+| `VerifyEvidenceDir(dir, verifyFn)` | whole directory; per-file failures are collected, not fatal; outcomes whose `decisionDigest` does not resolve to a decision in the same directory are reported as orphans (`OrphanOutcome`), never counted as consent |
 | `VerifyFnFromPublicKey(pub)` | the `verifyFn` above, from a pinned emission key |
 | `(*EvidenceBundle).CheckDecisions()` | a report bundle built by an exporter: its decision section must reference a record that still recomputes |
 
@@ -187,6 +187,6 @@ hard no as "try later".
 ## Versioning
 
 `Version` is the SDK version; `CLCRevision` is the language revision it evaluates
-(currently `CLC-1.5`, from `register/semantics`). A record carries the revision it
+(currently `CLC-1.8`, from `register/semantics`). A record carries the revision it
 was decided under, and an implementation refuses a revision it cannot read rather
 than downgrading silently.

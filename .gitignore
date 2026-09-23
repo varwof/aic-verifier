@@ -1,7 +1,16 @@
 # Build artifacts
 /mcp-server
+/showcase
+/inspect-record
+/mcp-behind-proxy
 *.exe
 *.test
+*.bak
+
+# Runtime artifacts (supervision event JSONL, profiler output, etc.)
+*.jsonl
+*.out
+*.prof
 
 # Editor / OS
 .idea/

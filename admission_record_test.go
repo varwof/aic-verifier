@@ -60,9 +60,10 @@ func TestRefusalEvidenceEmitsAdmissionRecord(t *testing.T) {
 	cert := testAICCert(t, false)
 	req := httptest.NewRequest("GET", "https://gw.example/whoami", nil)
 	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+	view := &RequestView{Method: req.Method, Path: req.URL.Path, Header: req.Header, PresentedCert: cert}
 
 	ae := &AuthError{Code: ErrChainInvalid, Status: 403, Message: "certificate chain invalid"}
-	refs := a.refusalEvidence(req, ae)
+	refs := a.refusalEvidence(view, ae)
 	if len(refs) != 1 {
 		t.Fatalf("refs = %v, want one admission record", refs)
 	}
@@ -97,13 +98,13 @@ func TestRefusalEvidenceEmitsAdmissionRecord(t *testing.T) {
 	// One refusal, one record: an error that already carries CLC records is not
 	// described a second time.
 	withEvidence := &AuthError{Code: ErrDenied, Status: 403, Message: "denied", Evidence: refs}
-	if got := a.refusalEvidence(req, withEvidence); got != nil {
+	if got := a.refusalEvidence(view, withEvidence); got != nil {
 		t.Errorf("a refusal with CLC records must not add an admission record: %v", got)
 	}
 
 	// Evidence disabled: nothing at all.
 	plain := &authenticator{cfg: &Config{}}
-	if got := plain.refusalEvidence(req, ae); got != nil {
+	if got := plain.refusalEvidence(view, ae); got != nil {
 		t.Errorf("evidence disabled must emit nothing: %v", got)
 	}
 	_ = filepath.Join // keep the import used on all platforms

@@ -9,6 +9,7 @@
 package aicverifier
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -28,25 +29,38 @@ type EvidenceFailure struct {
 type EvidenceVerifyReport struct {
 	// Total is the number of record envelopes scanned.
 	Total int
-	// Decision / Admission / Outcome are the per-kind record counts.
+	// Decision / Admission / Outcome are the per-kind record counts.  Outcome
+	// counts only outcomes whose decisionDigest resolved to a decision record
+	// in the same directory: an orphan (unresolved) outcome is counted
+	// separately and reported as a gap, never as consent.
 	Decision  int
 	Admission int
 	Outcome   int
+	// OrphanOutcome is the number of outcome records whose decisionDigest was
+	// empty or did not resolve to a decision record in this directory.  Each
+	// orphan is also listed in Failures with the file path, so a linkage gap is
+	// as visible as a record that does not verify.
+	OrphanOutcome int
 	// Failures lists every file that did not verify: malformed JSON, an
 	// envelope of an unknown predicate type, a decision that no longer
-	// recomputes, or (when verify was supplied) a record with no valid
-	// signature.  Empty means the directory verified clean.
+	// recomputes, an outcome whose decisionDigest does not resolve, or (when
+	// verify was supplied) a record with no valid signature.  Empty means the
+	// directory verified clean — and every outcome in it is linked.
 	Failures []EvidenceFailure
 }
 
 // VerifyEvidenceDir scans dir for evidence record envelopes and verifies each
 // one, dispatching on its statement's predicate type: a CLC decision must
 // re-compute, and an admission / outcome record must parse and be
-// shape-invariant (see CheckEvidenceEnvelope).  When verify is non-nil, every
-// envelope must also carry at least one signature that verifies over its DSSE
-// PAE (see VerifyEvidenceEnvelope).  A deployment that already trusts the
-// emission point's key passes VerifyFnFromPublicKey here and the key question
-// is settled without writing crypto.
+// shape-invariant (see CheckEvidenceEnvelope).  Outcomes are additionally
+// checked for linkage: their decisionDigest must resolve to a decision record
+// found in the same directory, or they are counted as orphans and listed in
+// Failures — an outcome that cannot be tied to the decision it claims to have
+// followed is a gap, not consent.  When verify is non-nil, every envelope must
+// also carry at least one signature that verifies over its DSSE PAE (see
+// VerifyEvidenceEnvelope).  A deployment that already trusts the emission
+// point's key passes VerifyFnFromPublicKey here and the key question is settled
+// without writing crypto.
 //
 // The scan is best-effort per file: a broken or unrecognized file is collected
 // in Failures, not returned as an error — an evidence directory with one bad
@@ -58,6 +72,14 @@ func VerifyEvidenceDir(dir string, verify func(keyID string, pae, sig []byte) er
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return rep, err
+	}
+	// First pass: classify every envelope and freeze the decision digests the
+	// outcomes must point at.  Outcomes are collected and linked in the second
+	// pass, once the decision set is complete.
+	decisionSet := map[string]bool{}
+	var outcomes []struct {
+		path string
+		env  semantics.Envelope
 	}
 	for _, de := range entries {
 		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
@@ -76,13 +98,42 @@ func VerifyEvidenceDir(dir string, verify func(keyID string, pae, sig []byte) er
 		}
 		switch kind {
 		case KindDecision:
+			rec, err := env.DecisionRecord()
+			if err != nil {
+				rep.Failures = append(rep.Failures, EvidenceFailure{Path: path, Reason: err.Error()})
+				continue
+			}
 			rep.Decision++
+			rep.Total++
+			decisionSet[hex.EncodeToString(rec.InputDigest.Value)] = true
 		case KindAdmission:
 			rep.Admission++
+			rep.Total++
 		case KindOutcome:
-			rep.Outcome++
+			outcomes = append(outcomes, struct {
+				path string
+				env  semantics.Envelope
+			}{path: path, env: env})
 		}
+	}
+	// Second pass: outcome linkage.  An outcome verifies only when its
+	// decisionDigest names a decision record that is present in this set.
+	for _, o := range outcomes {
 		rep.Total++
+		rec, err := ParseOutcomeEnvelope(o.env)
+		if err != nil {
+			rep.Failures = append(rep.Failures, EvidenceFailure{Path: o.path, Reason: err.Error()})
+			continue
+		}
+		if rec.DecisionDigest == "" || !decisionSet[rec.DecisionDigest] {
+			rep.OrphanOutcome++
+			rep.Failures = append(rep.Failures, EvidenceFailure{
+				Path:   o.path,
+				Reason: fmt.Sprintf("outcome decisionDigest %q does not resolve to a decision record in this set", rec.DecisionDigest),
+			})
+			continue
+		}
+		rep.Outcome++
 	}
 	return rep, nil
 }

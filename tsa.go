@@ -327,7 +327,10 @@ func extractTSTInfoFromCMS(tstDER []byte) (*TSTInfo, []*x509.Certificate, *cmsSi
 	}
 
 	var eci cmsEncapContentInfo
-	if _, err := asn1.Unmarshal(eciRaw.Bytes, &eci); err != nil {
+	// eciRaw.FullBytes includes the EncapsulatedContentInfo SEQUENCE header;
+	// Unmarshal into a struct requires it (asn1.Unmarshal on raw content would
+	// expect the SEQUENCE tag that .Bytes has already stripped).
+	if _, err := asn1.Unmarshal(eciRaw.FullBytes, &eci); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("parse encapContentInfo inner: %w", err)
 	}
 	if !eci.ContentType.Equal(oidTSTInfo) {
@@ -336,9 +339,15 @@ func extractTSTInfoFromCMS(tstDER []byte) (*TSTInfo, []*x509.Certificate, *cmsSi
 	if len(eci.Content.Bytes) == 0 {
 		return nil, nil, nil, nil, fmt.Errorf("missing eContent (TSTInfo octets)")
 	}
-	// eci.Content.Bytes is the encapContentInfo eContent octets (the TSTInfo DER);
-	// both the TSTInfo parse and the message-digest cross-check use these bytes.
+	// eContent is [0] EXPLICIT OCTET STRING per RFC 5652: unwrap the OCTET
+	// STRING so eContent is the TSTInfo DER. Some encoders (notably Go's
+	// encoding/asn1 for RawValue fields) emit the TSTInfo directly inside the
+	// [0] wrapper without the inner OCTET STRING; accept both forms.
 	eContent := eci.Content.Bytes
+	var octetString asn1.RawValue
+	if _, err := asn1.Unmarshal(eContent, &octetString); err == nil && octetString.Tag == asn1.TagOctetString {
+		eContent = octetString.Bytes
+	}
 
 	var tstInfo TSTInfo
 	if _, err := asn1.Unmarshal(eContent, &tstInfo); err != nil {
@@ -347,9 +356,9 @@ func extractTSTInfoFromCMS(tstDER []byte) (*TSTInfo, []*x509.Certificate, *cmsSi
 
 	var certs []*x509.Certificate
 	if len(rest) > 0 && rest[0] == 0xA0 {
-		if _, err := asn1.Unmarshal(rest, &raw); err == nil {
+		if newRest, err := asn1.Unmarshal(rest, &raw); err == nil {
 			certs = parseCertificatesFromRaw(raw.Bytes)
-			rest = rest[len(rest)-len(rest):] // clear rest after consuming certs
+			rest = newRest // advance past the consumed certificates element
 		}
 	}
 
@@ -362,7 +371,11 @@ func extractTSTInfoFromCMS(tstDER []byte) (*TSTInfo, []*x509.Certificate, *cmsSi
 			if len(signerInfosRaw.Bytes) > 0 {
 				var siRaw asn1.RawValue
 				if _, err := asn1.Unmarshal(signerInfosRaw.Bytes, &siRaw); err == nil {
-					signerInfo = parseSignerInfo(siRaw.Bytes)
+					var perr error
+					signerInfo, perr = parseSignerInfo(siRaw.Bytes)
+					if perr != nil {
+						return nil, nil, nil, nil, fmt.Errorf("tsa: parse signerInfo: %w", perr)
+					}
 				}
 			}
 		}
@@ -468,24 +481,33 @@ func findTSACert(certs []*x509.Certificate) *x509.Certificate {
 //	  signatureAlgorithm AlgorithmIdentifier,
 //	  signature OCTET STRING
 //	}
-func parseSignerInfo(data []byte) *cmsSignerInfo {
+func parseSignerInfo(data []byte) (*cmsSignerInfo, error) {
 	var rest = data
 	var raw asn1.RawValue
+	var err error
 
 	// version
-	rest, _ = asn1.Unmarshal(rest, &raw)
+	if rest, err = asn1.Unmarshal(rest, &raw); err != nil {
+		return nil, fmt.Errorf("tsa: unmarshal signer info: %w", err)
+	}
 	// sid (issuerAndSerialNumber or subjectKeyIdentifier)
-	rest, _ = asn1.Unmarshal(rest, &raw)
+	if rest, err = asn1.Unmarshal(rest, &raw); err != nil {
+		return nil, fmt.Errorf("tsa: unmarshal signer info: %w", err)
+	}
 	// digestAlgorithm
 	var digestAlgo asn1.RawValue
-	rest, _ = asn1.Unmarshal(rest, &digestAlgo)
+	if rest, err = asn1.Unmarshal(rest, &digestAlgo); err != nil {
+		return nil, fmt.Errorf("tsa: unmarshal signer info: %w", err)
+	}
 	digestOID := parseAlgorithmOID(digestAlgo.FullBytes)
 
 	// signedAttrs [0] IMPLICIT — optional
 	var signedAttrsRaw []byte
 	si := &cmsSignerInfo{}
 	if len(rest) > 0 && rest[0] == 0xa0 {
-		rest, _ = asn1.Unmarshal(rest, &raw)
+		if rest, err = asn1.Unmarshal(rest, &raw); err != nil {
+			return nil, fmt.Errorf("tsa: unmarshal signer info: %w", err)
+		}
 		signedAttrsRaw = raw.FullBytes
 		si.SignedAttrsRaw = signedAttrsRaw
 		// RFC 5652 §5.4: the signature is over the DER encoding of SignedAttributes
@@ -514,17 +536,21 @@ func parseSignerInfo(data []byte) *cmsSignerInfo {
 
 	// signatureAlgorithm
 	var sigAlgo asn1.RawValue
-	rest, _ = asn1.Unmarshal(rest, &sigAlgo)
+	if rest, err = asn1.Unmarshal(rest, &sigAlgo); err != nil {
+		return nil, fmt.Errorf("tsa: unmarshal signer info: %w", err)
+	}
 	sigOID := parseAlgorithmOID(sigAlgo.FullBytes)
 
 	// signature (OCTET STRING)
-	rest, _ = asn1.Unmarshal(rest, &raw)
+	if rest, err = asn1.Unmarshal(rest, &raw); err != nil {
+		return nil, fmt.Errorf("tsa: unmarshal signer info: %w", err)
+	}
 
 	si.DigestAlgorithm = digestOID
 	si.SignatureAlgo = sigOID
 	si.SignatureValue = raw.Bytes
 
-	return si
+	return si, nil
 }
 
 // parseAlgorithmOID extracts the OID from a DER-encoded AlgorithmIdentifier.
