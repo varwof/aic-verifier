@@ -17,7 +17,10 @@
 package aicverifier
 
 import (
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/asn1"
 	"errors"
@@ -27,14 +30,16 @@ import (
 	"github.com/varwof/register/semantics"
 )
 
-// signEnvelope applies the configured DSSE signer to an envelope.  A nil
-// signer is a no-op: an unsigned record is the valid default, and a deployment
-// decides whether records must be key-endorsed by setting EvidenceConfig.Sign.
+// signEnvelope applies the configured DSSE signer to an envelope.  A nil signer
+// is a no-op: an unsigned record is a valid shape, but a deployment that wants
+// key-endorsed evidence supplies a signer (EvidenceConfig.Signer or
+// SignKeyFile), and then every record is signed.
 func signEnvelope(env semantics.Envelope, cfg *EvidenceConfig) (semantics.Envelope, error) {
-	if cfg == nil || cfg.Sign == nil {
+	keyID, sign := cfg.signingKey()
+	if sign == nil {
 		return env, nil
 	}
-	if err := env.Sign(cfg.KeyID, cfg.Sign); err != nil {
+	if err := env.Sign(keyID, sign); err != nil {
 		return env, fmt.Errorf("evidence: sign record: %w", err)
 	}
 	return env, nil
@@ -80,24 +85,46 @@ func VerifyEvidenceEnvelope(env semantics.Envelope, verify func(keyID string, pa
 // against the key a deployment pinned via VerifyFnFromPublicKey.
 var ErrRecordSignerMismatch = errors.New("aic-verifier: record signature does not verify against the pinned key")
 
-// VerifyFnFromPublicKey returns the DSSE verification callback that
+// VerifyFnFromKey returns the DSSE verification callback that
 // VerifyEvidenceDir / VerifyEvidenceEnvelope expect, pinned to one trusted
-// ECDSA public key (P-256 / P-384 / P-521).  It closes the "who trusts the
-// record signer" question with one line instead of hand-rolled crypto per
-// call site: the key passed here is the trust anchor, the unauthenticated
-// keyid label is deliberately ignored.
+// public key.  It closes the "who trusts the record signer" question with one
+// line instead of hand-rolled crypto per call site: the key passed here is the
+// trust anchor, the unauthenticated keyid label is deliberately ignored.
 //
-// Both the raw r‖s form (the common DSSE/JSON-Sign convention, P-256 = 64
-// bytes) and ASN.1 DER are accepted, over the SHA-256 of the DSSE PAE.
-func VerifyFnFromPublicKey(pub *ecdsa.PublicKey) func(keyID string, pae, sig []byte) error {
+// ECDSA (P-256 / P-384 / P-521, raw r‖s or ASN.1 DER over SHA-256), RSA
+// (PKCS#1 v1.5 / SHA-256) and Ed25519 (over the PAE itself) are supported,
+// matching what RecordSigner produces.
+func VerifyFnFromKey(pub crypto.PublicKey) func(keyID string, pae, sig []byte) error {
 	return func(_ string, pae, sig []byte) error {
-		digest := sha256.Sum256(pae)
-		r, s := splitDSSESignature(sig)
-		if r == nil || s == nil || !ecdsa.Verify(pub, digest[:], r, s) {
-			return ErrRecordSignerMismatch
+		switch k := pub.(type) {
+		case *ecdsa.PublicKey:
+			digest := sha256.Sum256(pae)
+			r, s := splitDSSESignature(sig)
+			if r == nil || s == nil || !ecdsa.Verify(k, digest[:], r, s) {
+				return ErrRecordSignerMismatch
+			}
+			return nil
+		case *rsa.PublicKey:
+			digest := sha256.Sum256(pae)
+			if err := rsa.VerifyPKCS1v15(k, crypto.SHA256, digest[:], sig); err != nil {
+				return ErrRecordSignerMismatch
+			}
+			return nil
+		case ed25519.PublicKey:
+			if !ed25519.Verify(k, pae, sig) {
+				return ErrRecordSignerMismatch
+			}
+			return nil
+		default:
+			return fmt.Errorf("%w: unsupported key type %T", ErrRecordSignerMismatch, pub)
 		}
-		return nil
 	}
+}
+
+// VerifyFnFromPublicKey is the ECDSA-specialised form of VerifyFnFromKey, kept
+// for callers that already hold an *ecdsa.PublicKey.
+func VerifyFnFromPublicKey(pub *ecdsa.PublicKey) func(keyID string, pae, sig []byte) error {
+	return VerifyFnFromKey(pub)
 }
 
 // splitDSSESignature reads r and s out of a signature in either the ASN.1 DER

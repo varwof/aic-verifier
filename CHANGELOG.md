@@ -9,6 +9,31 @@ a minor.
 
 ## [Unreleased]
 
+## [v0.3.0-rc2] — 2026-09-23
+
+### Added
+
+- **Key-endorsed evidence signing as the default posture.** `RecordSigner` +
+  `NewRecordSigner` + `LoadRecordSignerFile` load a PEM key (PKCS#1 / PKCS#8 /
+  SEC1; RSA, ECDSA or Ed25519) or wrap an HSM/KMS, and `EvidenceConfig.Signer` /
+  `SignKeyFile` sign every emitted envelope. Supplying a key is all it takes —
+  there is no separate on-switch. `EvidenceConfig.RequireSignature` fails
+  configuration closed when no key is present. `VerifyFnFromKey` is the
+  three-algorithm verifier; `RecordSigner.VerifyFn()` pins it to one key.
+- **The evidence bundle can sign itself.** `EvidenceBundle.Sign` /
+  `SigningBytes` / `VerifySignature` cover the canonical bundle with the DSSE
+  PAE (domain-separated by `BundlePayloadType`), and `FileEvidenceExporter.Signer`
+  signs on export.
+- **Human-readable renderings.** `EvidenceBundle.Render` / `RenderMarkdown` /
+  `RenderCSV` / `RenderText` (`WriteRendered`) turn a bundle into a printable
+  document, a spreadsheet/forensic CSV, or plain text — all derived from one row
+  set, with escaping that keeps audit-sourced names and paths from breaking the
+  output.
+- **Single-operation emission for execution points.** `EmitOperationEvidence`
+  freezes (and, with a signer, signs) one decision record for a projected
+  operation, so an executor outside the admission pipeline leaves the same
+  replayable record.
+
 ## [v0.3.0-rc1] — 2026-09-23
 
 ### Added
@@ -136,7 +161,8 @@ a minor.
 - README with status, install, scope and related-repository sections; SPDX
   headers on example sources.
 
-[Unreleased]: https://github.com/varwof/aic-verifier/compare/v0.3.0-rc1...HEAD
+[Unreleased]: https://github.com/varwof/aic-verifier/compare/v0.3.0-rc2...HEAD
+[v0.3.0-rc2]: https://github.com/varwof/aic-verifier/compare/v0.3.0-rc1...v0.3.0-rc2
 [v0.3.0-rc1]: https://github.com/varwof/aic-verifier/compare/v0.2.0...v0.3.0-rc1
 [v0.2.0]: https://github.com/varwof/aic-verifier/releases/tag/v0.2.0
 [v0.1.0]: https://github.com/varwof/aic-verifier/releases/tag/v0.1.0

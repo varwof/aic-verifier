@@ -333,6 +333,11 @@ func (c *Config) Validate() error {
 	if c.SupervisionPolicy.RequireEvidenceExport && c.EvidenceExporter == nil {
 		errs = append(errs, fmt.Errorf("aic-verifier: require_evidence_export needs an EvidenceExporter"))
 	}
+	if ev := c.Evidence; ev != nil && ev.RequireSignature {
+		if _, sign := ev.signingKey(); sign == nil && ev.SignKeyFile == "" {
+			errs = append(errs, fmt.Errorf("aic-verifier: evidence.require_signature needs a signing key (Signer, Sign or SignKeyFile)"))
+		}
+	}
 	switch len(errs) {
 	case 0:
 		return nil
@@ -599,6 +604,9 @@ func newAuthenticator(c *Config) (*authenticator, error) {
 			return nil, err
 		}
 		c.Evidence = ev
+	}
+	if err := c.Evidence.resolveSigner(); err != nil {
+		return nil, err
 	}
 
 	mode := c.authMode()

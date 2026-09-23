@@ -50,9 +50,9 @@ AIC-JWT structures).
 | **Capability language** | CLC-1.8 concrete operations, capability id matching, parameter bounds (`max_rows`, enums, …), authorization constraints (CIDR, time window, concurrency), residual obligations |
 | **Delegation** | DA / DA-v2 signature verification, delegation chains, `EffectiveDelegationCapabilities`, DA freshness, principal-key binding, representative-mode rejection |
 | **Integration** | middleware (`Handler` / `AuthMiddleware`) around your handler; reverse proxy (`NewServer`) injecting `X-AIC-*`; transport-independent `DecisionServer` (`Decide`, HTTP, gRPC, admin, health) |
-| **Evidence** | per-decision DSSE-wrapped CLC decision records, plus admission and outcome records; `FileSink`/`SlogSink`; **optional DSSE signing** (`EvidenceConfig.Sign`); per-admission nonces; RATS §10 freshness; profiles; requirement binding |
-| **Evidence verification** | `VerifyEvidenceDir` (structure + signature + decision↔outcome linkage, orphan reporting), `VerifyEvidenceEnvelope`, `VerifyFnFromPublicKey` (pinned key), `LoadEvidenceRecord` |
-| **Evidence export** | `FileEvidenceExporter` → `EvidenceBundle` v0.1 (manifest / operation / subject / authorization / decision / supervision / Merkle-chained audit / signatures) |
+| **Evidence** | per-decision DSSE-wrapped CLC decision records, plus admission and outcome records; `FileSink`/`SlogSink`; **key-endorsed signing** (`EvidenceConfig.Signer` / `SignKeyFile` / `Sign`, with `RequireSignature` to fail closed); per-admission nonces; RATS §10 freshness; profiles; requirement binding |
+| **Evidence verification** | `VerifyEvidenceDir` (structure + signature + decision↔outcome linkage, orphan reporting), `VerifyEvidenceEnvelope`, `VerifyFnFromKey` / `VerifyFnFromPublicKey` (pinned key), `RecordSigner.VerifyFn()`, `LoadEvidenceRecord` |
+| **Evidence export** | `FileEvidenceExporter` → `EvidenceBundle` v0.1 (manifest / operation / subject / authorization / decision / supervision / Merkle-chained audit / signatures), with the **bundle itself signable** (`EvidenceBundle.Sign` / `VerifySignature`) and **human-readable renderings** (`RenderMarkdown` / `RenderCSV` / `RenderText`, `WriteRendered`) |
 | **Challenges** | `CLC-CHALLENGE-v1`: a *remediable* refusal answered with RFC 9457 `application/problem+json` + `Retry-After`, listing what evidence is missing |
 | **Audit** | Merkle-chained `AuditLogger` (TSA-signable), `VerifyAuditEntry`, `FilterAuditFile`, `ArchiveAuditFile` |
 | **Supervision** | runtime human approval (`ApprovalRequester`), break-glass with mandatory recording (`OverrideRecorder`), `RequireApproval` trigger, `SupervisionPolicy`, append-only `SupervisionStore` |
@@ -193,17 +193,32 @@ ac, err := core.Decide(ctx, &aicverifier.RequestView{
 ### Turn on evidence, then verify it offline
 
 ```go
+signer, _ := aicverifier.LoadRecordSignerFile("/etc/aic/evidence-key.pem", "pep-1")
 conf.Evidence = &aicverifier.EvidenceConfig{
-    Sink:     &aicverifier.FileSink{Dir: "/var/lib/aic/evidence", RecorderID: "pep-1"},
-    Audience: "https://gateway-a.example",
-    TTL:      5 * time.Minute,             // RATS §10.1 freshness clock
-    Sign:     myDSSESigner,                // optional: key-endorse every record
-    KeyID:    "pep-1-key",
-    Strict:   true,                        // fail closed if the sink is down
+    Sink:             &aicverifier.FileSink{Dir: "/var/lib/aic/evidence", RecorderID: "pep-1"},
+    Audience:         "https://gateway-a.example",
+    TTL:              5 * time.Minute,     // RATS §10.1 freshness clock
+    Signer:           signer,              // key-endorse every record (RSA/ECDSA/Ed25519)
+    RequireSignature: true,                // refuse to start without a signing key
+    Strict:           true,                // fail closed if the sink is down
 }
 // ...later, off the hot path:
 rep, err := aicverifier.VerifyEvidenceDir("/var/lib/aic/evidence",
-    aicverifier.VerifyFnFromPublicKey(pub))  // pinned key; verifies sigs + linkage
+    signer.VerifyFn())                     // pinned key; verifies sigs + linkage
+```
+
+### Export a bundle, sign it, and render it for a human
+
+```go
+exporter := &aicverifier.FileEvidenceExporter{
+    AuditFile:         "/var/lib/aic/audit.jsonl",
+    SupervisionFile:   "/var/lib/aic/supervision.jsonl",
+    EvidenceDir:       "/var/lib/aic/evidence",
+    Signer:            signer,             // sign the package itself, not just the records
+}
+bundle, _ := exporter.Export(ctx, aicverifier.EvidenceQuery{AgentID: "agent-001"})
+bundle.VerifySignature(signer.VerifyFn())  // a holder re-checks the export
+bundle.WriteRendered("/tmp/evidence.md",    aicverifier.RenderMarkdown) // or RenderCSV / RenderText
 ```
 
 ### Answer a remediable refusal with a challenge

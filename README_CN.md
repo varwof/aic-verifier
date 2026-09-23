@@ -44,9 +44,9 @@
 | **能力语言** | CLC-1.8 具体操作、能力 ID 匹配、参数边界（`max_rows`、枚举……）、授权约束（CIDR、时间窗、并发）、残差义务 |
 | **委托** | DA / DA-v2 签名校验、委托链、`EffectiveDelegationCapabilities`、DA 新鲜度、主体密钥绑定、代表模式拒绝 |
 | **集成方式** | 中间件（`Handler` / `AuthMiddleware`）包住你的 handler；反向代理（`NewServer`）注入 `X-AIC-*`；传输无关的 `DecisionServer`（`Decide`、HTTP、gRPC、admin、health） |
-| **证据** | 每次裁决的 DSSE 封装 CLC 裁决记录，另加 admission 与 outcome 记录；`FileSink`/`SlogSink`；**可选 DSSE 签名**（`EvidenceConfig.Sign`）；per-admission nonce；RATS §10 新鲜度；profile；requirement 绑定 |
-| **证据验证** | `VerifyEvidenceDir`（结构 + 签名 + 裁决↔结果链接，孤儿上报）、`VerifyEvidenceEnvelope`、`VerifyFnFromPublicKey`（钉公钥）、`LoadEvidenceRecord` |
-| **证据导出** | `FileEvidenceExporter` → `EvidenceBundle` v0.1（manifest / operation / subject / authorization / decision / supervision / Merkle 审计链 / signatures） |
+| **证据** | 每条裁决一条 DSSE 封装的 CLC 裁决记录，另加 admission 与 outcome 记录；`FileSink`/`SlogSink`；**密钥背书签名**（`EvidenceConfig.Signer` / `SignKeyFile` / `Sign`，`RequireSignature` 可 fail-closed）；per-admission nonce；RATS §10 新鲜度；profile；requirement 绑定 |
+| **证据验证** | `VerifyEvidenceDir`（结构 + 签名 + 裁决↔结果链接，孤儿上报）、`VerifyEvidenceEnvelope`、`VerifyFnFromKey` / `VerifyFnFromPublicKey`（钉公钥）、`RecordSigner.VerifyFn()`、`LoadEvidenceRecord` |
+| **证据导出** | `FileEvidenceExporter` → `EvidenceBundle` v0.1（manifest / operation / subject / authorization / decision / supervision / Merkle 审计链 / signatures），**包本身可签名**（`EvidenceBundle.Sign` / `VerifySignature`），并可**人类可读渲染**（`RenderMarkdown` / `RenderCSV` / `RenderText`、`WriteRendered`） |
 | **挑战** | `CLC-CHALLENGE-v1`：可补救的拒绝以 RFC 9457 `application/problem+json` + `Retry-After` 应答，并列出缺什么证据 |
 | **审计** | Merkle 链式 `AuditLogger`（可 TSA 签名）、`VerifyAuditEntry`、`FilterAuditFile`、`ArchiveAuditFile` |
 | **监督** | 运行时人工审批（`ApprovalRequester`）、破玻璃的强制记录（`OverrideRecorder`）、`RequireApproval` 触发点、`SupervisionPolicy`、append-only `SupervisionStore` |
@@ -179,17 +179,32 @@ ac, err := core.Decide(ctx, &aicverifier.RequestView{
 ### 打开证据，然后离线验证
 
 ```go
+signer, _ := aicverifier.LoadRecordSignerFile("/etc/aic/evidence-key.pem", "pep-1")
 conf.Evidence = &aicverifier.EvidenceConfig{
-    Sink:     &aicverifier.FileSink{Dir: "/var/lib/aic/evidence", RecorderID: "pep-1"},
-    Audience: "https://gateway-a.example",
-    TTL:      5 * time.Minute,             // RATS §10.1 新鲜度时钟
-    Sign:     myDSSESigner,                // 可选：给每条记录做密钥背书
-    KeyID:    "pep-1-key",
-    Strict:   true,                        // sink 挂了就 fail closed
+    Sink:             &aicverifier.FileSink{Dir: "/var/lib/aic/evidence", RecorderID: "pep-1"},
+    Audience:         "https://gateway-a.example",
+    TTL:              5 * time.Minute,     // RATS §10.1 新鲜度时钟
+    Signer:           signer,              // 给每条记录做密钥背书（RSA/ECDSA/Ed25519）
+    RequireSignature: true,                // 没有签名密钥就拒绝启动
+    Strict:           true,                // sink 挂了就 fail closed
 }
 // ...之后，在热路径之外：
 rep, err := aicverifier.VerifyEvidenceDir("/var/lib/aic/evidence",
-    aicverifier.VerifyFnFromPublicKey(pub))  // 钉公钥；校验签名 + 链接
+    signer.VerifyFn())                     // 钉公钥；校验签名 + 链接
+```
+
+### 导出证据包、签名，再渲染给人看
+
+```go
+exporter := &aicverifier.FileEvidenceExporter{
+    AuditFile:       "/var/lib/aic/audit.jsonl",
+    SupervisionFile: "/var/lib/aic/supervision.jsonl",
+    EvidenceDir:     "/var/lib/aic/evidence",
+    Signer:          signer,               // 给包本身签名，不只是记录
+}
+bundle, _ := exporter.Export(ctx, aicverifier.EvidenceQuery{AgentID: "agent-001"})
+bundle.VerifySignature(signer.VerifyFn())  // 持有者可复核这次导出
+bundle.WriteRendered("/tmp/evidence.md",   aicverifier.RenderMarkdown) // 或 RenderCSV / RenderText
 ```
 
 ### 用挑战应答一次可补救的拒绝

@@ -8,4 +8,4 @@ package aicverifier
 //
 // Released tag: v<Version>. Bump it and tag together (hack/versioncheck.sh
 // enforces that Version is not older than the latest tag).
-var Version = "0.3.0-rc1"
+var Version = "0.3.0-rc2"

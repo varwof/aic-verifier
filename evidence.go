@@ -229,6 +229,11 @@ type FileEvidenceExporter struct {
 	// Generator is the bundle.generator label; empty defaults to the package
 	// version.
 	Generator string
+	// Signer, when set, key-endorses every exported bundle: the package itself
+	// carries a signature over its canonical bytes (sans signatures), so a
+	// holder can verify the export was produced by this key, not assembled by
+	// hand.  nil leaves the bundle unsigned (a report).
+	Signer *RecordSigner
 	// Now overrides the export clock (tests).
 	Now func() time.Time
 }
@@ -313,6 +318,11 @@ func (e *FileEvidenceExporter) Export(ctx context.Context, q EvidenceQuery) (*Ev
 			bundle.AuditChain.MerkleRoot = evidenceSHA256Pf + root
 		}
 	}
+	if e.Signer != nil {
+		if err := bundle.Sign(e.Signer.KeyID(), e.Signer.Sign); err != nil {
+			return nil, fmt.Errorf("evidence_exporter: sign bundle: %w", err)
+		}
+	}
 	return bundle, nil
 }
 
@@ -324,6 +334,104 @@ func (b *EvidenceBundle) JSON() ([]byte, error) {
 		return nil, fmt.Errorf("evidence_bundle: nil")
 	}
 	return CanonicalJSON(b)
+}
+
+// BundlePayloadType domain-separates a bundle signature from the record DSSE
+// signatures: the same key never signs two different meanings with the same
+// bytes.
+const BundlePayloadType = "application/vnd.varwof.aic-evidence-bundle.v0.1+json"
+
+// bundleSignature is one entry in EvidenceBundle.Signatures: a DSSE-style
+// (keyid, sig) pair.  KeyID is an unauthenticated hint.
+type bundleSignature struct {
+	KeyID string `json:"keyid,omitempty"`
+	Sig   []byte `json:"sig"`
+}
+
+// SigningBytes returns the canonical serialization of the bundle with the
+// Signatures map emptied — the exact bytes a bundle signature covers.  Emptying
+// it first is what lets signatures not have to cover themselves.
+func (b *EvidenceBundle) SigningBytes() ([]byte, error) {
+	if b == nil {
+		return nil, fmt.Errorf("evidence_bundle: nil")
+	}
+	clone := *b
+	clone.Signatures = map[string]json.RawMessage{}
+	return CanonicalJSON(&clone)
+}
+
+// Sign appends a signature over PAE(BundlePayloadType, SigningBytes()) — the
+// same pre-authentication encoding the record envelopes use, so one verifier
+// covers both.  keyID names the signing key (unauthenticated hint); entries are
+// keyed by it, so signing twice with the same id replaces rather than stacks.
+func (b *EvidenceBundle) Sign(keyID string, sign func(pae []byte) ([]byte, error)) error {
+	if b == nil {
+		return fmt.Errorf("evidence_bundle: nil")
+	}
+	if sign == nil {
+		return fmt.Errorf("evidence_bundle: nil signer")
+	}
+	body, err := b.SigningBytes()
+	if err != nil {
+		return err
+	}
+	sig, err := sign(semantics.PAE(BundlePayloadType, body))
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(bundleSignature{KeyID: keyID, Sig: sig})
+	if err != nil {
+		return err
+	}
+	if b.Signatures == nil {
+		b.Signatures = map[string]json.RawMessage{}
+	}
+	b.Signatures[keyID] = raw
+	return nil
+}
+
+// VerifySignature requires at least one bundle signature to verify over the
+// signing bytes (PAE of the bundle without its signatures).  A bundle with no
+// signatures, or none that verify, fails — a bundle is evidence of who issued
+// it only when key-endorsed.  verify is a RecordSigner.VerifyFn /
+// VerifyFnFromKey callback.
+func (b *EvidenceBundle) VerifySignature(verify func(keyID string, pae, sig []byte) error) error {
+	if b == nil {
+		return fmt.Errorf("evidence_bundle: nil")
+	}
+	if verify == nil {
+		return fmt.Errorf("evidence_bundle: nil verifier")
+	}
+	if len(b.Signatures) == 0 {
+		return fmt.Errorf("evidence_bundle: no signatures")
+	}
+	body, err := b.SigningBytes()
+	if err != nil {
+		return err
+	}
+	pae := semantics.PAE(BundlePayloadType, body)
+	var firstErr error
+	for _, raw := range b.Signatures {
+		var s bundleSignature
+		if err := json.Unmarshal(raw, &s); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("evidence_bundle: malformed signature: %w", err)
+			}
+			continue
+		}
+		if len(s.Sig) == 0 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("evidence_bundle: empty signature")
+			}
+			continue
+		}
+		if err := verify(s.KeyID, pae, s.Sig); err == nil {
+			return nil
+		} else if firstErr == nil {
+			firstErr = fmt.Errorf("evidence_bundle: signature does not verify: %w", err)
+		}
+	}
+	return firstErr
 }
 
 // CanonicalJSON serializes v with keys sorted lexicographically at every level

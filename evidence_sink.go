@@ -130,8 +130,28 @@ type EvidenceConfig struct {
 	// is an unauthenticated hint, never trusted on its own.  A signing failure
 	// follows the existing emission rules: OnError is called, and Strict denies
 	// the request.
+	//
+	// Prefer Signer over Sign for new deployments: Signer carries its own key id
+	// and public key, so verification needs no separate key exchange.  Sign is
+	// kept for callers that already hold a signing closure.
 	Sign  func(pae []byte) ([]byte, error)
 	KeyID string
+	// Signer, when set, key-endorses every emitted envelope and supersedes
+	// Sign/KeyID.  Supplying a key is all it takes to sign — there is no
+	// separate on-switch, because an unsigned compliance record is exactly the
+	// gap this closes.  Load one from a PEM file with LoadRecordSignerFile, or
+	// wrap an HSM/KMS with NewRecordSigner.
+	Signer *RecordSigner
+	// SignKeyFile, when set and Signer is nil, is a PEM private key (PKCS#1 /
+	// PKCS#8 / SEC1; RSA, ECDSA or Ed25519) loaded once when the handler is
+	// built and used with KeyID.  It is sugar for Signer =
+	// LoadRecordSignerFile(SignKeyFile, KeyID).
+	SignKeyFile string
+	// RequireSignature, when true, refuses to build without a signing key
+	// (Signer / Sign / SignKeyFile): a deployment whose evidence is worthless
+	// unless key-endorsed fails closed at configuration time, not silently at
+	// read time.
+	RequireSignature bool
 	// EmitOutcome, when true, makes the request path report an outcome record
 	// after every admitted request: the reverse proxy observes the backend
 	// (a response → observed + status; a transport failure → indeterminate) and
@@ -418,6 +438,17 @@ func evidenceRecorders(aic *AIC, pa *PrincipalAuthorization) map[string][]semant
 		}
 	}
 	return out
+}
+
+// EmitOperationEvidence freezes and (when configured) signs one CLC decision
+// record for a single projected operation, returning where it went.  It is the
+// execution-boundary entry point (aic-exec): a component that adjudicates a
+// concrete operation outside the admission pipeline leaves the same replayable
+// record the pipeline would, without carrying the whole pipeline's inputs.  The
+// record's verdict is recomputed from aic's grants, so a record that does not
+// reproduce is impossible by construction.
+func EmitOperationEvidence(cfg *EvidenceConfig, ctx EvidenceContext, cert *x509.Certificate, aic *AIC, op OperationDecision) ([]RecordRef, error) {
+	return EmitDecisionRecords(cfg, ctx, cert, aic, nil, nil, []OperationDecision{op})
 }
 
 // EmitDecisionRecords freezes one record per (source, operation) and hands it to
