@@ -131,7 +131,7 @@ properties are enforced:
   cannot reach, but it cannot make a reachable-but-stale responder tell the truth.
 - **No policy authoring.** The SDK evaluates CLC capabilities; it does not ship a
   GUI or an authoring tool, and it evaluates exactly the revision it declares
-  (`CLCRevision`, currently CLC-1.8). It refuses to read a revision it does not
+  (`CLCRevision`, currently CLC-1.15). It refuses to read a revision it does not
   understand rather than downgrading.
 - **DoS-by-credential volume.** Minting and checking credentials is cheap, but a
   flood is still a flood. Put the instance behind the usual rate/connection

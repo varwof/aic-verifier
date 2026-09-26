@@ -187,6 +187,6 @@ hard no as "try later".
 ## Versioning
 
 `Version` is the SDK version; `CLCRevision` is the language revision it evaluates
-(currently `CLC-1.8`, from `register/semantics`). A record carries the revision it
+(currently `CLC-1.15`, from `register/semantics`). A record carries the revision it
 was decided under, and an implementation refuses a revision it cannot read rather
 than downgrading silently.

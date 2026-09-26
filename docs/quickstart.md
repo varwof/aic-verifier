@@ -127,7 +127,7 @@ go run ./examples/inspect-record records/smoke-verify-d355cc50...json
 ```
 
 ```
-language   clc-v1 (CLC-1.8)
+language   clc-v1 (CLC-1.15)
 operation  demo/example-v1:api:read
 verdict    allow
 inputs     sha-256:01XMUHOFFVE76Rc4NIn2IZnL_m0wyLyDt6pyWYvmvOE
