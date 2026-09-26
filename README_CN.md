@@ -29,7 +29,7 @@
 > 可嵌入的准入核心。它负责裁决与记录；路由、自带反代之外的各种转发、以及"执行"，都属于调用方。
 > `aic-exec` 就是建立在它之上的命令执行边界。
 
-它求值的是能力语言的 **CLC-1.8** 修订版，依赖
+它求值的是能力语言的 **CLC-1.15** 修订版，依赖
 [`register v0.6.0`](https://github.com/varwof/register)（CLC 参考实现）与
 [`types v0.6.0`](https://github.com/varwof/types)（AIC / AIC-JWT 结构）。
 
@@ -41,7 +41,7 @@
 |---|---|
 | **凭据** | 带 AIC X.509 扩展的 mTLS 客户端证书，或 `Authorization: Bearer <AIC-JWT>`；`AuthMode` = `MTLSOnly` / `BearerOnly` / `MTLSOrBearer` |
 | **裁决管线** | 证书有效性 → CRL/OCSP 吊销 → 角色 → AIC 裁决 → 能力 ∩ 主体授权 → 参数边界 → **allow / allow_unresolved / deny** |
-| **能力语言** | CLC-1.8 具体操作、能力 ID 匹配、参数边界（`max_rows`、枚举……）、授权约束（CIDR、时间窗、并发）、残差义务 |
+| **能力语言** | CLC-1.15 具体操作、能力 ID 匹配、参数边界（`max_rows`、枚举……）、授权约束（CIDR、时间窗、并发）、残差义务 |
 | **委托** | DA / DA-v2 签名校验、委托链、`EffectiveDelegationCapabilities`、DA 新鲜度、主体密钥绑定、代表模式拒绝 |
 | **集成方式** | 中间件（`Handler` / `AuthMiddleware`）包住你的 handler；反向代理（`NewServer`）注入 `X-AIC-*`；传输无关的 `DecisionServer`（`Decide`、HTTP、gRPC、admin、health） |
 | **证据** | 每条裁决一条 DSSE 封装的 CLC 裁决记录，另加 admission 与 outcome 记录；`FileSink`/`SlogSink`；**密钥背书签名**（`EvidenceConfig.Signer` / `SignKeyFile` / `Sign`，`RequireSignature` 可 fail-closed）；per-admission nonce；RATS §10 新鲜度；profile；requirement 绑定 |

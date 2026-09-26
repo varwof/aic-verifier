@@ -34,7 +34,7 @@ evidence record** bound to the principal that authorized it.
 > records; routing, proxying beyond the bundled reverse proxy, and execution belong
 > to the caller. `aic-exec` is the command-execution boundary built on top.
 
-It evaluates the **CLC-1.8** revision of the capability language and depends on
+It evaluates the **CLC-1.15** revision of the capability language and depends on
 [`register v0.6.0`](https://github.com/varwof/register) (the CLC reference
 implementation) and [`types v0.6.0`](https://github.com/varwof/types) (AIC /
 AIC-JWT structures).
@@ -47,7 +47,7 @@ AIC-JWT structures).
 |---|---|
 | **Credentials** | mTLS client certificate carrying an AIC X.509 extension, or `Authorization: Bearer <AIC-JWT>`; `AuthMode` = `MTLSOnly` / `BearerOnly` / `MTLSOrBearer` |
 | **Decision pipeline** | certificate validity → CRL/OCSP revocation → roles → AIC decision → capability ∩ principal authorization → parameter bounds → **allow / allow_unresolved / deny** |
-| **Capability language** | CLC-1.8 concrete operations, capability id matching, parameter bounds (`max_rows`, enums, …), authorization constraints (CIDR, time window, concurrency), residual obligations |
+| **Capability language** | CLC-1.15 concrete operations, capability id matching, parameter bounds (`max_rows`, enums, …), authorization constraints (CIDR, time window, concurrency), residual obligations |
 | **Delegation** | DA / DA-v2 signature verification, delegation chains, `EffectiveDelegationCapabilities`, DA freshness, principal-key binding, representative-mode rejection |
 | **Integration** | middleware (`Handler` / `AuthMiddleware`) around your handler; reverse proxy (`NewServer`) injecting `X-AIC-*`; transport-independent `DecisionServer` (`Decide`, HTTP, gRPC, admin, health) |
 | **Evidence** | per-decision DSSE-wrapped CLC decision records, plus admission and outcome records; `FileSink`/`SlogSink`; **key-endorsed signing** (`EvidenceConfig.Signer` / `SignKeyFile` / `Sign`, with `RequireSignature` to fail closed); per-admission nonces; RATS §10 freshness; profiles; requirement binding |

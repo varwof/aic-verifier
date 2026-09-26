@@ -15,7 +15,7 @@ shapes, constants, versions and conventions. Use it as a lookup while you read
 | Module | `github.com/varwof/aic-verifier` |
 | Go | `go 1.26`, no cgo |
 | `Version` | package constant (currently the release this tree is on) |
-| `CLCRevision` | `semantics.CLCRevision` → **CLC-1.8** (via `register`) |
+| `CLCRevision` | `semantics.CLCRevision` → **CLC-1.15** (via `register`) |
 | Decision language record | `clc-v1` (RecordLang) |
 | Record container | DSSE/in-toto envelope |
 
@@ -160,7 +160,7 @@ up as a challenge.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `CLCRevision` | `"CLC-1.8"` | language revision decided with |
+| `CLCRevision` | `"CLC-1.15"` | language revision decided with |
 | `AdmissionRecordPredicateType` | `aic/v1/admission-record` | admission payload |
 | `OutcomeRecordPredicateType` | `aic/v1/outcome-record` | outcome payload |
 | `ProblemContentType` | `application/problem+json` | RFC 9457 shape |
