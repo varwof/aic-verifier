@@ -281,9 +281,10 @@ func jwtToAIC(outer *aicjwt.OuterClaims) *pki.AIC {
 	// AIC-JWT the delegation authorization is represented by the outer.da
 	// claim (JWT form); authorize-mode tokens carry none. Synthesize a
 	// present-but-neutral placeholder so the certificate pipeline admits
-	// the bearer; its signature/replay checks only run when explicitly
-	// configured (RequireUserAuth / NonceCache), which a JWT carrier does
-	// not satisfy. The nonce is derived deterministically from the JTI so
+	// the bearer. There is no X.509 DA signature to check: VerifyBearer
+	// already validated the outer.da claim, and callers admitting a bearer
+	// set SkipDelegationAuthVerification so step 4 does not run against this
+	// placeholder. The nonce is derived deterministically from the JTI so
 	// the same token always synthesizes the same carrier.
 	aic.DelegationAuthorization = pki.DelegationAuthorization{
 		RequestedLifetime:  requestedLifetimeOf(outer),

@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
+	"errors"
 	"fmt"
 	"github.com/varwof/register/semantics"
 	"log/slog"
@@ -112,6 +113,14 @@ type AdmissionConfig struct {
 	RejectOverflow bool
 	// RequireUserAuth when set to true requires DelegationAuthorization signature verification in the AIC.
 	RequireUserAuth bool
+	// SkipDelegationAuthVerification disables the DelegationAuthorization
+	// signature verification that the agent-certificate verification
+	// procedure mandates unconditionally (draft Section 12 step 4). The zero
+	// value verifies; set it only where the deployment has no way to obtain
+	// the principal certificate, and expect delegated admissions to fail
+	// closed while it is false. RequireUserAuth is not this switch: it
+	// selects whether a principal certificate must be supplied.
+	SkipDelegationAuthVerification bool
 	// EnforceCapSizeConstraints when set to true validates Capability field lengths (schemeId 1-128, capabilityId 1-256, parameters 0-4096).
 	EnforceCapSizeConstraints bool
 	// NonceCache is used for DelegationAuthorization nonce replay protection.
@@ -149,7 +158,7 @@ type AdmissionConfig struct {
 	// deployments requiring stricter time window defense can enable this.
 	CheckDAAge bool
 	// DAAgeMax is the DA timestamp freshness window (|now - timestamp| ≤ DAAgeMax).
-	// Only effective when CheckDAAge=true; <=0 uses DefaultDAAgeMax (30 seconds).
+	// Only effective when CheckDAAge=true; <=0 uses DefaultDAAgeMax (1 minute).
 	DAAgeMax time.Duration
 	// CredentialBundle is the client-submitted credential bundle (agent, principal and CA chains).
 	// When RequireUserAuth is true and UserCert is nil, prioritizes the Principal certificate
@@ -159,8 +168,15 @@ type AdmissionConfig struct {
 }
 
 // DefaultDAAgeMax is the default value for the DelegationAuthorization.timestamp freshness window
-// (the delegation-authorization validation flow: |now - timestamp| ≤ 30s).
-const DefaultDAAgeMax = 30 * time.Second
+// (the delegation-authorization validation flow: |now - timestamp| ≤ 1m).
+//
+// The authoritative value is varwof/core internal.DefaultDATimestampSkew
+// (serve.da_max_timestamp_skew, "1m"). This was 30s here until it was aligned:
+// a 30s default rejected DA timestamps that a gateway-core front end accepted,
+// so the same certificate was admitted at the edge and denied at the service.
+// Note that core's own prose (docs/openapi.yaml, docs/core/*/configuration.md)
+// still says 30s — that documentation is stale, the code constant is 1m.
+const DefaultDAAgeMax = time.Minute
 
 // CheckDAFreshness validates that DelegationAuthorization.timestamp is within the freshness window.
 // When now is nil, uses time.Now(); when maxAge <= 0, uses DefaultDAAgeMax.
@@ -243,7 +259,7 @@ func CheckAuthorizationConstraintsAt(constraints []Capability, clientIP, timeHHM
 }
 
 // checkConstraintsAt evaluates authorizationConstraints one by one through the global constraint registry.
-// Only processes constraint / constraint-v1 scheme entries; other schemes are skipped as business capabilities.
+// Processes constraint / constraint-v1 scheme entries; a foreign schemeId is rejected (draft-wei-aic-identity-cert-02: the schemeId MUST be one of "varwof/constraint-v1").
 func checkConstraintsAt(constraints []Capability, clientIP string, now time.Time) error {
 	return checkConstraintsReg(globalConstraintRegistry, constraints, clientIP, now)
 }
@@ -254,7 +270,12 @@ func checkConstraintsReg(reg *ConstraintRegistry, constraints []Capability, clie
 	ctx := &ConstraintContext{ClientIP: clientIP, Now: now}
 	for _, c := range constraints {
 		if !isConstraintScheme(c.SchemeId) {
-			continue
+			// draft-wei-aic-identity-cert-02, authorizationConstraints:
+			// "The schemeId MUST be one of "varwof/constraint-v1"; any
+			// other schemeId MUST be rejected."  Unknown capabilityId stays
+			// ignored below (forward compatible); a foreign scheme is a
+			// malformed constraint, not an unrecognized type.
+			return fmt.Errorf("constraint schemeId %q: must be %q", c.SchemeId, "varwof/constraint-v1")
 		}
 		ev, err := reg.Find(c.CapabilityId)
 		if err != nil {
@@ -572,74 +593,11 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		}
 	}
 
-	// denyOp carries the decisions already made into the refusal, so a refusal
-	// is as auditable as an admission: evidence emission and the challenge
-	// carrier both read OperationDecisions, and the result docstring promises
-	// they survive the deny path.
-	denyOp := func(format string, args ...any) AdmissionResult {
-		return AdmissionResult{
-			Decision:               DecisionDeny,
-			Reason:                 fmt.Sprintf(format, args...),
-			AIC:                    result.AIC,
-			PrincipalAuthorization: result.PrincipalAuthorization,
-			PrincipalUid:           result.PrincipalUid,
-			OperationDecisions:     result.OperationDecisions,
-		}
-	}
-
-	// Concrete-operation authorization (CLC).  The id-only check above cannot
-	// see parameters, so a grant of {"tables":["a"]} and a request for
-	// {"tables":["a","b"]} look identical to it.  Each declared operation is
-	// decided by the CLC core instead, over the effective authority.
-	for _, op := range cfg.Operations {
-		dec, err := AuthorizeOperation(aic, result.PrincipalAuthorization, op.ID, op.Params)
-		if err != nil {
-			return AdmissionResult{
-				Decision: DecisionDeny,
-				Reason:   fmt.Sprintf("operation %s: %v", op.ID, err),
-			}
-		}
-		od := OperationDecision{
-			ID:         op.ID,
-			Params:     op.Params,
-			Verdict:    dec.Verdict,
-			Reason:     dec.Reason,
-			Unresolved: dec.Unresolved,
-			Grants:     decisionGrants(aic, result.PrincipalAuthorization),
-		}
-		result.OperationDecisions = append(result.OperationDecisions, od)
-		switch dec.Verdict {
-		case semantics.VerdictAllow:
-			// authorized outright
-			if err := checkDecisionContext(cfg); err != nil {
-				return denyOp("operation %s: %v", op.ID, err)
-			}
-		case semantics.VerdictDeny:
-			return denyOp("operation %s denied: %s", op.ID, dec.Reason)
-		default:
-			// allow_unresolved is an independent verdict carrying §8.4 residual
-			// obligations; reading it as "allow" would fail open.
-			//
-			// Strict mode first applies the consumer-side rule (XACML §2.13:
-			// deny unless the consumer understands and can discharge every
-			// obligation), then the deployment's value-level confirmation.
-			if cfg.DischargeObligations {
-				if err := semantics.Discharge(dec, cfg.ObligationsUnderstood); err != nil {
-					return denyOp("operation %s: %v", op.ID, err)
-				}
-			}
-			if cfg.UnresolvedEvaluator != nil && cfg.UnresolvedEvaluator(op, dec.Unresolved) {
-				// The deployment confirmed the residual obligations; the operation
-				// is released but must still be honored at runtime. Only opt-in
-				// paths reach here — nil (default) keeps fail-closed deny.
-				if err := checkDecisionContext(cfg); err != nil {
-					return denyOp("operation %s: %v", op.ID, err)
-				}
-				result.OperationDecisions[len(result.OperationDecisions)-1].Released = true
-				continue
-			}
-			return denyOp("operation %s: %s (unresolved %v)", op.ID, dec.Verdict, dec.Unresolved)
-		}
+	// Concrete-operation authorization (CLC).  Lives in clc.go so this file stays
+	// line-for-line comparable with gateway-core's decision.go; see
+	// docs/parity-gateway-core.md.
+	if denied := evaluateCLCOperations(aic, &result, &cfg); denied != nil {
+		return *denied
 	}
 
 	// Check delegation mode (v1.4: check if AIC.DelegationMode is representative)
@@ -667,8 +625,11 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 		}
 	}
 
-	// Verify DelegationAuthorization signature
-	if aic != nil && cfg.RequireUserAuth {
+	// Verify DelegationAuthorization signature. Mandatory in the verification
+	// procedure (draft Section 12 step 4): the zero-value configuration
+	// verifies. RequireUserAuth only selects whether a principal certificate
+	// has to be supplied, so it no longer gates this step.
+	if aic != nil && !cfg.SkipDelegationAuthVerification {
 		if len(aic.DelegationAuthorization.SignatureValue) == 0 {
 			return AdmissionResult{Decision: DecisionDeny, Reason: "user_auth: signature required but empty"}
 		}
@@ -728,7 +689,7 @@ func CheckAdmission(cert *x509.Certificate, cfg AdmissionConfig) AdmissionResult
 				}
 			}
 		}
-		if err := VerifyDelegationAuth(aic, userCert); err != nil {
+		if err := VerifyDelegationAuthWithAgent(aic, userCert, cert); err != nil {
 			return AdmissionResult{
 				Decision: DecisionDeny,
 				Reason:   fmt.Sprintf("user_auth: %v", err),
@@ -827,7 +788,23 @@ func effectiveCapabilities(declared []Capability, grants []string) []Capability 
 // VerifyDelegationAuth verifies the validity of a DelegationAuthorization signature.
 // aic must contain a non-empty DelegationAuthorization; userCert is the authorizing user's certificate.
 // The signed content is the DelegationAuthTBS DER encoding (a specific subset, not the entire AIC).
+//
+// This is the two-argument form, kept for API compatibility. It cannot supply the
+// agent SPKI, so a DA version 2 authorization (agentKeyBinding) is rejected. New
+// call sites that hold the agent certificate should use
+// VerifyDelegationAuthWithAgent, which is what the admission path uses.
 func VerifyDelegationAuth(aic *AIC, userCert *x509.Certificate) error {
+	return VerifyDelegationAuthWithAgent(aic, userCert, nil)
+}
+
+// VerifyDelegationAuthWithAgent verifies the validity of a DelegationAuthorization
+// signature, binding it to the agent certificate that carries the AIC when the DA
+// is version 2. aic must contain a non-empty DelegationAuthorization; userCert is
+// the authorizing user's certificate; agentCert is the certificate carrying the
+// AIC, whose SPKI the DA version 2 agentKeyBinding covers.
+//
+// Mirrors varwof/gateway-core decision.go VerifyDelegationAuth; keep the two in step.
+func VerifyDelegationAuthWithAgent(aic *AIC, userCert *x509.Certificate, agentCert *x509.Certificate) error {
 	if aic == nil {
 		return fmt.Errorf("verify_user_auth: nil aic")
 	}
@@ -839,9 +816,77 @@ func VerifyDelegationAuth(aic *AIC, userCert *x509.Certificate) error {
 		return fmt.Errorf("verify_user_auth: empty signature")
 	}
 
+	var agentSPKI []byte
+	if agentCert != nil && agentCert.PublicKey != nil {
+		spki, err := x509.MarshalPKIXPublicKey(agentCert.PublicKey)
+		if err != nil {
+			return fmt.Errorf("verify_user_auth: marshal agent SPKI: %w", err)
+		}
+		agentSPKI = spki
+	}
+
+	// DA version negotiation mirrors core/internal/ca: version 0 (unspecified)
+	// prefers version 2 when the agent SPKI is available, then falls back to v1;
+	// version 1 uses the legacy DER; version 2 requires a non-empty agent SPKI.
+	version := aic.Version
+	switch version {
+	case 0:
+		if len(agentSPKI) > 0 {
+			if err := verifyDelegationAuthTBS(aic, userCert, agentSPKI, pki.DAVersion2); err == nil {
+				return nil
+			}
+		}
+		return verifyDelegationAuthTBS(aic, userCert, agentSPKI, pki.DAVersion1)
+	case pki.DAVersion1:
+		return verifyDelegationAuthTBS(aic, userCert, agentSPKI, pki.DAVersion1)
+	case pki.DAVersion2:
+		if len(agentSPKI) == 0 {
+			return fmt.Errorf("verify_user_auth: DA version 2 requires the agent certificate (agent SPKI binding)")
+		}
+		return verifyDelegationAuthTBS(aic, userCert, agentSPKI, pki.DAVersion2)
+	default:
+		return fmt.Errorf("verify_user_auth: unsupported DA version %d (must be 0, 1, or 2)", version)
+	}
+}
+
+// errDASignatureMismatch marks a DelegationAuthTBS whose signature did not
+// verify at the attempted DA version. It is the only failure that justifies
+// retrying a different version encoding; every other rejection (keyHash
+// cross-check, unsupported algorithm, malformed TBS) is definitive and must be
+// reported as-is.
+var errDASignatureMismatch = errors.New("delegation auth signature mismatch")
+
+// verifyDelegationAuthTBS dispatches on the effective DA version. Version 2
+// appends the agentKeyBinding over the agent SPKI; version 1 accepts both the
+// explicit v1 encoding (Version INTEGER 1) and the legacy encoding (Version
+// INTEGER 0 emitted by pre-v2 signers), since the ASN.1 default:1 tag does not
+// collapse the two on marshal.
+//
+// The legacy retry is gated on errDASignatureMismatch. Without that gate the
+// retry's own error replaces the real one: a version-1 DA with a valid
+// signature but a mismatched PrincipalUid.KeyHash fails the cross-check, falls
+// through to the version-0 attempt, and surfaces "signature verification
+// failed" instead of the keyHash mismatch that actually caused the denial.
+func verifyDelegationAuthTBS(aic *AIC, userCert *x509.Certificate, agentSPKI []byte, version int) error {
+	if version == pki.DAVersion2 {
+		return verifyDelegationAuthTBSAt(aic, userCert, agentSPKI, pki.DAVersion2)
+	}
+	err := verifyDelegationAuthTBSAt(aic, userCert, agentSPKI, pki.DAVersion1)
+	if err != nil && errors.Is(err, errDASignatureMismatch) {
+		err = verifyDelegationAuthTBSAt(aic, userCert, agentSPKI, 0)
+	}
+	return err
+}
+
+// verifyDelegationAuthTBSAt reconstructs the DelegationAuthTBS at the given DA
+// version, hashes its DER encoding and verifies the signature against the user
+// certificate's public key, with the SPKI hash cross-check.
+func verifyDelegationAuthTBSAt(aic *AIC, userCert *x509.Certificate, agentSPKI []byte, version int) error {
+	ua := aic.DelegationAuthorization
+
 	// Construct DelegationAuthTBS for signature verification (spec §6 DelegationAuthTBS)
 	tbs := DelegationAuthTBS{
-		Version:                  aic.Version,
+		Version:                  version,
 		AgentId:                  aic.AgentId,
 		PrincipalUid:             aic.PrincipalUid,
 		Reason:                   ua.Reason,
@@ -851,6 +896,21 @@ func VerifyDelegationAuth(aic *AIC, userCert *x509.Certificate) error {
 		RequestedLifetime:        ua.RequestedLifetime,
 		Timestamp:                ua.Timestamp,
 		Nonce:                    ua.Nonce,
+	}
+	if version == pki.DAVersion2 {
+		binding, err := pki.MakeAgentKeyBinding(nil, agentSPKI)
+		if err != nil {
+			return fmt.Errorf("verify_user_auth: agent key binding: %w", err)
+		}
+		tbs.AgentKeyBinding = binding
+	}
+	// draft-wei-aic-identity-cert-02 verification step 4, version/validation
+	// matrix: v1 requires agentKeyBinding absent, v2 requires it present and
+	// valid, any other version is rejected, and the binding hashAlgo/length
+	// must be supported.  Validating the reconstructed TBS keeps that helper
+	// on the inbound path rather than test-only.
+	if err := pki.ValidateDelegationAuthTBSVersion(&tbs); err != nil {
+		return fmt.Errorf("verify_user_auth: %w", err)
 	}
 	tbsDER, err := asn1.Marshal(tbs)
 	if err != nil {
@@ -864,17 +924,17 @@ func VerifyDelegationAuth(aic *AIC, userCert *x509.Certificate) error {
 			return fmt.Errorf("verify_user_auth: unsupported ECDSA algorithm OID %s", ua.SignatureAlgorithm.Algorithm)
 		}
 		if !ecdsa.VerifyASN1(pub, digest[:], ua.SignatureValue) {
-			return fmt.Errorf("verify_user_auth: ecdsa signature verification failed")
+			return fmt.Errorf("verify_user_auth: ecdsa signature verification failed: %w", errDASignatureMismatch)
 		}
 	case *rsa.PublicKey:
 		switch {
 		case ua.SignatureAlgorithm.Algorithm.Equal(OIDSigRSAWithSHA256):
 			if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], ua.SignatureValue); err != nil {
-				return fmt.Errorf("verify_user_auth: rsa-sha256 verification: %w", err)
+				return fmt.Errorf("verify_user_auth: rsa-sha256 verification: %w", errors.Join(err, errDASignatureMismatch))
 			}
 		case ua.SignatureAlgorithm.Algorithm.Equal(OIDSigRSAPSSWithSHA256):
 			if err := rsa.VerifyPSS(pub, crypto.SHA256, digest[:], ua.SignatureValue, nil); err != nil {
-				return fmt.Errorf("verify_user_auth: rsa-pss-sha256 verification: %w", err)
+				return fmt.Errorf("verify_user_auth: rsa-pss-sha256 verification: %w", errors.Join(err, errDASignatureMismatch))
 			}
 		default:
 			return fmt.Errorf("verify_user_auth: unsupported RSA algorithm OID %s", ua.SignatureAlgorithm.Algorithm)
@@ -914,7 +974,7 @@ type DelegationChainVerifier struct {
 	// MaxDepth is the maximum delegation depth allowed by the top Principal (including intermediate Agent B etc.).
 	MaxDepth int
 	// MaxChainLength is the hard upper limit to prevent certificate bomb attacks:
-	// ≤0 means no extra limit (only constrained by MaxDepth).
+	// ≤0 uses DefaultMaxChainLength; the anti-bomb bound cannot be disabled.
 	MaxChainLength int
 }
 
@@ -941,8 +1001,14 @@ func (v *DelegationChainVerifier) Verify(chain []*x509.Certificate, topPrincipal
 	if len(chain) > v.MaxDepth {
 		return fmt.Errorf("delegation_chain: chain depth %d exceeds maxDepth %d", len(chain), v.MaxDepth)
 	}
-	// Anti-loop + anti-certificate-bomb.
-	if err := verifyChainStructure(chain, v.MaxChainLength); err != nil {
+	// Anti-loop + anti-certificate-bomb.  MaxChainLength <= 0 must not
+	// disable the limit: fall back to DefaultMaxChainLength, the same bound
+	// VerifyDelegationChainWithCaps applies.
+	maxChainLen := v.MaxChainLength
+	if maxChainLen <= 0 {
+		maxChainLen = DefaultMaxChainLength
+	}
+	if err := verifyChainStructure(chain, maxChainLen); err != nil {
 		return err
 	}
 
@@ -969,7 +1035,7 @@ func (v *DelegationChainVerifier) Verify(chain []*x509.Certificate, topPrincipal
 		}
 
 		// This level's AIC.DA signer should be signer (SPKI hash cross-validation + signature verification)
-		if err := VerifyDelegationAuth(aic, signer); err != nil {
+		if err := VerifyDelegationAuthWithAgent(aic, signer, cert); err != nil {
 			return fmt.Errorf("delegation_chain level %d (%s): %w", i, cert.Subject.CommonName, err)
 		}
 	}
@@ -981,7 +1047,7 @@ func (v *DelegationChainVerifier) Verify(chain []*x509.Certificate, topPrincipal
 // chain goes from top to bottom: chain[0]=top-level delegating Agent, chain[len-1]=bottom-level Agent.
 // maxDepth is set by the top Principal.
 func VerifyDelegationChain(chain []*x509.Certificate, topPrincipal *x509.Certificate, maxDepth int) error {
-	v := &DelegationChainVerifier{MaxDepth: maxDepth}
+	v := &DelegationChainVerifier{MaxDepth: maxDepth, MaxChainLength: DefaultMaxChainLength}
 	return v.Verify(chain, topPrincipal)
 }
 
@@ -1175,12 +1241,3 @@ func isConstraintScheme(scheme string) bool {
 // The clock is read here and nowhere else: the decision itself stays a pure
 // function of (grants, operation), and the instant it was appraised at is what
 // the context pins.
-func checkDecisionContext(cfg AdmissionConfig) error {
-	if !cfg.RequireFreshDecisionContext {
-		return nil
-	}
-	if cfg.DecisionContext == nil {
-		return semantics.ErrContextMissing
-	}
-	return cfg.DecisionContext.Fresh(time.Now().UTC())
-}

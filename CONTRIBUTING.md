@@ -70,6 +70,42 @@ should prove round-trips (emit → read back → verify) and the failure modes
   input boundaries, digest scope, TTL/nonce semantics); rename or restructure
   rather than describing implementation steps.
 
+## Mirrored files (protocol execution logic)
+
+`aic.go` / `decision.go` / `pipeline.go` / `constraints.go` / `policy.go` /
+`rbac.go` / `user_permission.go` / `delegation_chain.go` / `credential_bundle.go` /
+`crl.go` / `ocsp.go` / `tsa.go` / `jwt.go` / `spiffe.go` / `nonce_cache.go` /
+`merkle.go` / `mask.go` / `parameters.go` / `plugin.go` / `capregistry.go` /
+`riskmonitor.go` / `trust_model.go` are file-for-file mirrors of
+[varwof/gateway-core](https://github.com/varwof/gateway-core). The two modules do
+**not** share code — this one does not depend on gateway-core — so the parity is
+maintained by hand. `docs/architecture.md` states the derivation; gateway-core has
+the mirror note in its `CONTRIBUTING.md`.
+
+When you touch one of those files:
+
+1. Land it here first, then copy it into gateway-core in the same commit (the
+   package is `gw` there, `aicverifier` here; only the package clause and import
+   paths differ).
+2. Admission verdicts, denial-reason strings, TTL/time windows and fail-closed
+   behaviour must be identical. Divergence is only acceptable on config surface
+   that does not exist on the other side — this repo's CLC operation layer
+   (`Operations`, `aggregateCLCDecisions`, obligation discharge, decision-context
+   freshness) and its `ConstraintRegistry`, versus gateway-core's `gmsm`,
+   `pipeline_aac`, `shortlived`/`confirmed_renewal` and `selfverify`.
+3. Never change a denial-reason string on one side only; it is the de facto
+   cross-implementation contract.
+
+Authoritative values, confirmed against the upstream spec repos before changing
+any of them:
+
+| Value | Source of truth |
+|---|---|
+| `DefaultDAAgeMax = 1m` | varwof/core `internal.DefaultDATimestampSkew` (core's own docs still say 30s — stale) |
+| replay store default capacity 65536, fail closed at capacity | see the `NewReplayNonceStore` comment in `jwt.go` |
+| same-scope nonce reuse is deliberately uncapped | see the `CheckAndAdd` comment in `nonce_cache.go` |
+| SPIFFE trust domain case-insensitive (RFC 7555 §2.1) | `spiffe.go` |
+
 ## Commit messages
 
 Conventional-style, imperative subject, scope for the touched area:

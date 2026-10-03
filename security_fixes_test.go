@@ -8,7 +8,8 @@
 //
 //  1. jwt.go            — replay-store default capacity 65536 (not 4096) and the
 //                         eviction warning that must not be silent (C1).
-//  2. nonce_cache.go    — same-scope nonce reuse is bounded at maxScopeUse (C2).
+//  2. nonce_cache.go    — cross-scope nonce reuse is rejected while same-scope
+//                         reuse is deliberately uncapped (C2, revised).
 //  3. ocsp.go           — the fallback_allow path logs every unproven allowance (C3).
 //  5. server.go         — X-Forwarded-For is captured from the real peer before
 //                         the reverse proxy rewrites it (M4).
@@ -119,33 +120,32 @@ func TestReplayStoreEvictionWarning(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. nonce_cache.go — same-scope nonce reuse is bounded (C2)
+// 2. nonce_cache.go — scope separation, no same-scope cap
 // ---------------------------------------------------------------------------
 
-// TestNonceCacheSameScopeLimit pins the C2 fix: the "same certificate scope"
-// carve-out was an unbounded allow, so a nonce captured from one cert could be
-// driven in an endless loop inside that cert's own scope. Reuse is now capped
-// at maxScopeUse, after which CheckAndAdd fails closed.
-func TestNonceCacheSameScopeLimit(t *testing.T) {
-	const use = int(maxScopeUse)
-
-	t.Run("same_scope_reuse_bounded_at_maxScopeUse", func(t *testing.T) {
+// TestNonceCacheScopeSeparation pins the scope semantics: a nonce presented
+// under a *different* certificate scope is a DA replay attack and is rejected,
+// while the same certificate re-presenting its own (static) DA nonce on every
+// request is normal traffic and must not be capped.
+//
+// An earlier revision capped same-scope reuse at maxScopeUse=3. That was wrong:
+// the DA nonce is an X.509 extension value, so it does not rotate per request,
+// and any long-lived agent was denied from its 4th request onward. gateway-core
+// never had the cap, which is why gateway traffic was unaffected — see the
+// rationale comment on NonceCache.CheckAndAdd.
+func TestNonceCacheScopeSeparation(t *testing.T) {
+	t.Run("same_scope_reuse_unbounded", func(t *testing.T) {
 		nc := NewNonceCache()
 		defer nc.Stop()
 
-		var got []bool
-		for i := 0; i < use+2; i++ {
-			got = append(got, nc.CheckAndAdd("cert-A", []byte("nonce-1")))
-		}
-		// The first use (insert) plus maxScopeUse-1 reuses pass; every further
-		// same-scope reuse is rejected: want [true*3, false*2] with maxScopeUse=3.
-		for i, v := range got {
-			if want := i < use; v != want {
-				t.Errorf("use %d: got %v, want %v — same-scope reuse must be capped at %d", i+1, v, want, use)
+		const requests = 64
+		for i := 0; i < requests; i++ {
+			if !nc.CheckAndAdd("cert-A", []byte("nonce-1")) {
+				t.Fatalf("request %d: same-scope reuse must be allowed — the DA nonce is static per certificate", i+1)
 			}
 		}
 		if n := nc.Len(); n != 1 {
-			t.Errorf("Len() = %d, want 1 (a single nonce entry, whatever its use count)", n)
+			t.Errorf("Len() = %d, want 1 (a single nonce entry)", n)
 		}
 	})
 

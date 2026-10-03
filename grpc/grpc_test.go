@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"github.com/varwof/aic-verifier"
+	aictest "github.com/varwof/aic-verifier/internal/aictest"
 	pki "github.com/varwof/types"
 )
 
@@ -40,7 +41,6 @@ func testAICCert(t *testing.T) *x509.Certificate {
 		AgentId: "agent-1",
 		PrincipalUid: pki.PrincipalUid{
 			Version: 1, Realm: "pki", Identifier: "user-1",
-			KeyHash:  make([]byte, 32),
 			HashAlgo: pki.AlgorithmIdentifier{Algorithm: pki.OIDSHA256},
 		},
 		Capabilities: []pki.Capability{{
@@ -49,12 +49,14 @@ func testAICCert(t *testing.T) *x509.Certificate {
 		}},
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:             pki.Reason{ReasonCode: "API_ISSUE", Description: "test"},
-			RequestedLifetime:  3600,
+			RequestedLifetime:  86400,
 			Timestamp:          time.Now().UTC(),
 			Nonce:              make([]byte, 32),
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
-			SignatureValue:     []byte{0x01},
 		},
+	}
+	if err := aictest.SelfAuthorizeDA(key, aic); err != nil {
+		t.Fatal(err)
 	}
 	aicDER, err := asn1.Marshal(*aic)
 	if err != nil {

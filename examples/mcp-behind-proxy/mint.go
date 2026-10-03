@@ -7,7 +7,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -18,6 +17,7 @@ import (
 	"os"
 	"time"
 
+	aictest "github.com/varwof/aic-verifier/internal/aictest"
 	pki "github.com/varwof/types"
 	"github.com/varwof/types/aicjwt"
 )
@@ -166,14 +166,11 @@ func mintAICClientCert(dir string) error {
 		return err
 	}
 
-	subjectKey, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	keyHash := sha256.Sum256(subjectKey)
 	aic := pki.AIC{
 		Version: 1,
 		AgentId: "agent-001",
 		PrincipalUid: pki.PrincipalUid{
 			Version: 1, Realm: "example", Identifier: "agent-001",
-			KeyHash: keyHash[:],
 		},
 		Capabilities: []pki.Capability{
 			{SchemeId: "mcp", CapabilityId: "db_query"},
@@ -182,9 +179,12 @@ func mintAICClientCert(dir string) error {
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:             pki.Reason{ReasonCode: "operator-request", Description: "mcp-behind-proxy demo"},
 			Nonce:              make([]byte, 32),
-			RequestedLifetime:  3600,
+			RequestedLifetime:  86400,
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
 		},
+	}
+	if err := aictest.SelfAuthorizeDA(key, &aic); err != nil {
+		return err
 	}
 	aicDER, err := asn1.Marshal(aic)
 	if err != nil {

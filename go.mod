@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/varwof/pkcs7 v0.1.1
-	github.com/varwof/types v0.6.0
+	github.com/varwof/types v0.7.1
 	golang.org/x/crypto v0.54.0
 )
 

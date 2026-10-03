@@ -5,7 +5,6 @@ package aicverifier
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -17,14 +16,10 @@ type NonceCache struct {
 	stopOnce sync.Once
 }
 
-// nonceEntry records the certificate scope, time of a nonce's first appearance,
-// and how many times it has been used. count bounds same-scope reuses so a
-// nonce captured from one cert cannot be driven unchecked inside its own scope
-// (C2).
+// nonceEntry records the certificate scope and time of a nonce's first appearance.
 type nonceEntry struct {
 	scope string
 	seen  time.Time
-	count atomic.Int32
 }
 
 // NewNonceCache creates a NonceCache and starts automatic cleanup (hourly, retaining entries within 24h).
@@ -65,25 +60,25 @@ func (nc *NonceCache) Stop() {
 // replaying the same nonce" (normal) from "DA evidence copied into a different cert"
 // (attack). Returns true to allow.
 //
-// Same-scope reuse is allowed only a bounded number of times (maxScopeUse) to
-// close the case where the "same scope" carve-out was an unbounded allow (C2):
-// a legitimate retry is a handful of attempts, so unlimited reuse indicates the
-// nonce is being driven in a loop.
-const maxScopeUse = 3
-
+// Same-scope reuse is deliberately NOT bounded. The DA nonce lives inside the
+// certificate, so a long-lived agent re-presents the identical (scope, nonce)
+// pair on every request; capping reuses denies legitimate traffic from the 4th
+// request onward. Reuse within one scope carries no new authority — the same
+// key proved the same evidence — so the attack this cache exists to stop (DA
+// evidence copied into a *different* certificate) is the cross-scope case
+// below. Mirrored in varwof/gateway-core nonce_cache.go; keep the two in step.
 func (nc *NonceCache) CheckAndAdd(scope string, nonce []byte) bool {
 	if len(nonce) == 0 {
 		return false
 	}
 	key := string(nonce)
 	entry := &nonceEntry{scope: scope, seen: time.Now()}
-	entry.count.Store(1)
 	actual, loaded := nc.m.LoadOrStore(key, entry)
 	if !loaded {
 		return true
 	}
 	if e, ok := actual.(*nonceEntry); ok && e.scope == scope {
-		return e.count.Add(1) <= maxScopeUse
+		return true
 	}
 	return false
 }

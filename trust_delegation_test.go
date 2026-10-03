@@ -686,11 +686,15 @@ func TestCheckDAFreshness(t *testing.T) {
 	if err := CheckDAFreshness(now.Add(10*time.Second), now, 30*time.Second); err != nil {
 		t.Errorf("future-but-fresh DA rejected: %v", err)
 	}
-	// maxAge <= 0 uses DefaultDAAgeMax.
+	// maxAge <= 0 uses DefaultDAAgeMax, which is 1m (aligned with
+	// gateway-core and varwof/core internal.DefaultDATimestampSkew).
 	if err := CheckDAFreshness(now.Add(-5*time.Second), now, 0); err != nil {
 		t.Errorf("fresh DA with default window rejected: %v", err)
 	}
-	if err := CheckDAFreshness(now.Add(-time.Minute), now, 0); err == nil {
+	if err := CheckDAFreshness(now.Add(-30*time.Second), now, 0); err != nil {
+		t.Errorf("DA 30s old must be inside the 1m default window: %v", err)
+	}
+	if err := CheckDAFreshness(now.Add(-61*time.Second), now, 0); err == nil {
 		t.Error("stale DA accepted with default window")
 	}
 }
@@ -1067,5 +1071,22 @@ func TestVerifyTrustLayers(t *testing.T) {
 	denied := VerifyTrustLayers([]*x509.Certificate{plain}, &PipelineConfig{RequireAIC: true})
 	if denied.Granted || !strings.Contains(denied.DenyReason, "aic extension required") {
 		t.Errorf("require_aic denial = %+v", denied)
+	}
+}
+
+// TestVerifyDelegationChain_DefaultAntiBombLimit: the 3-argument convenience
+// entry point must enforce the certificate-bomb bound. It used to leave
+// MaxChainLength at its zero value, which verifyChainStructure read as "no
+// limit", so a caller could verify an unbounded chain.
+func TestVerifyDelegationChain_DefaultAntiBombLimit(t *testing.T) {
+	_, principal := mintCert(t, nil, nil, "principal", big.NewInt(1), nil, nil, nil)
+	chain := make([]*x509.Certificate, 0, DefaultMaxChainLength+1)
+	for i := 0; i < DefaultMaxChainLength+1; i++ {
+		_, c := mintCert(t, nil, nil, "agent", big.NewInt(int64(100+i)), nil, nil, nil)
+		chain = append(chain, c)
+	}
+	err := VerifyDelegationChain(chain, principal, 100)
+	if err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("chain longer than DefaultMaxChainLength must be rejected, got %v", err)
 	}
 }

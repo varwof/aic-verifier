@@ -78,6 +78,11 @@ type PipelineConfig struct {
 	RejectOverflow bool
 	// RequireUserAuth requires user authentication.
 	RequireUserAuth bool
+	// SkipDelegationAuthVerification disables the DelegationAuthorization
+	// signature verification mandated by the agent-certificate verification
+	// procedure (draft Section 12 step 4). Zero value = verify; see
+	// AdmissionConfig.SkipDelegationAuthVerification.
+	SkipDelegationAuthVerification bool
 	// EnforceCapSizeConstraints enforces capability size constraints.
 	EnforceCapSizeConstraints bool
 	// EnforceSize32 enforces the 32-byte size constraint.
@@ -264,14 +269,21 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		if err != nil {
 			return deny(fmt.Sprintf("invalid spiffe id: %v", err))
 		}
-		if cfg.SPIFFETrustDomain != "" && sid.TrustDomain != cfg.SPIFFETrustDomain {
+		// RFC 7555 §2.1: the trust domain is case-insensitive. ParseSPIFFEID
+		// already lowercased sid.TrustDomain; lowercase the configured value
+		// too so "Example.ORG" in config matches "spiffe://example.org/...".
+		if cfg.SPIFFETrustDomain != "" && sid.TrustDomain != strings.ToLower(cfg.SPIFFETrustDomain) {
 			return deny(fmt.Sprintf("spiffe trust domain mismatch: have %s, want %s",
 				sid.TrustDomain, cfg.SPIFFETrustDomain))
 		}
 		if len(cfg.AllowedSPIFFEIDs) > 0 {
+			// Trust domains are case-insensitive (RFC 7555), so compare in a
+			// canonical form that lowercases the trust domain only; a
+			// case-variant of a trusted ID must not slip past the allowlist.
 			allowed := false
+			cand := canonicalSPIFFEID(spiffeID)
 			for _, id := range cfg.AllowedSPIFFEIDs {
-				if id == spiffeID {
+				if canonicalSPIFFEID(id) == cand {
 					allowed = true
 					break
 				}
@@ -294,45 +306,31 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		}
 	}
 
-	admit := CheckAdmission(clientCert, AdmissionConfig{
-		RequireAIC:                  cfg.RequireAIC,
-		RequiredProtocol:            cfg.RequiredProtocol,
-		RequiredRuleId:              cfg.RequiredRuleId,
-		RequiredCapabilities:        cfg.RequiredCapabilities,
-		Operations:                  cfg.Operations,
-		UnresolvedEvaluator:         cfg.UnresolvedEvaluator,
-		DischargeObligations:        cfg.DischargeObligations,
-		ObligationsUnderstood:       cfg.ObligationsUnderstood,
-		RequireFreshDecisionContext: cfg.RequireFreshDecisionContext,
-		DecisionContext:             cfg.DecisionContext,
-		DisallowRepresentative:      cfg.DisallowRepresentative,
-		RequireUserPermission:       cfg.RequireUserPermission,
-		RejectOverflow:              cfg.RejectOverflow,
-		RequireUserAuth:             cfg.RequireUserAuth,
-		EnforceCapSizeConstraints:   cfg.EnforceCapSizeConstraints,
-		EnforceSize32:               cfg.EnforceSize32,
-		NonceCache:                  cfg.NonceCache,
-		UserCert:                    cfg.UserCert,
-		UserCertResolver:            cfg.UserCertResolver,
-		ClientIP:                    cfg.ClientIP,
-		EnforceConstraints:          cfg.EnforceConstraints,
-		StrictConstraints:           cfg.StrictConstraints,
-		ConstraintRegistry:          cfg.ConstraintRegistry,
-		AuditLogger:                 cfg.AuditLogger,
-		CredentialBundle:            cfg.CredentialBundle,
-	})
+	ac := AdmissionConfig{
+		RequireAIC:                     cfg.RequireAIC,
+		RequiredProtocol:               cfg.RequiredProtocol,
+		RequiredRuleId:                 cfg.RequiredRuleId,
+		RequiredCapabilities:           cfg.RequiredCapabilities,
+		DisallowRepresentative:         cfg.DisallowRepresentative,
+		RequireUserPermission:          cfg.RequireUserPermission,
+		RejectOverflow:                 cfg.RejectOverflow,
+		RequireUserAuth:                cfg.RequireUserAuth,
+		SkipDelegationAuthVerification: cfg.SkipDelegationAuthVerification,
+		EnforceCapSizeConstraints:      cfg.EnforceCapSizeConstraints,
+		EnforceSize32:                  cfg.EnforceSize32,
+		NonceCache:                     cfg.NonceCache,
+		UserCert:                       cfg.UserCert,
+		UserCertResolver:               cfg.UserCertResolver,
+		ClientIP:                       cfg.ClientIP,
+		EnforceConstraints:             cfg.EnforceConstraints,
+		StrictConstraints:              cfg.StrictConstraints,
+		AuditLogger:                    cfg.AuditLogger,
+		CredentialBundle:               cfg.CredentialBundle,
+	}
+	applyCLCAdmissionConfig(&ac, cfg)
+	admit := CheckAdmission(clientCert, ac)
 	if admit.Decision != DecisionAllow {
-		// A refusal is auditable too: carry the decisions already made (and the
-		// authority they were made over) into the denied result, the same way
-		// CheckAdmission does.  Evidence emission and the challenge carrier both
-		// read these fields, and an empty list would silently turn a refusal
-		// into "nothing to record".
-		res := deny(admit.Reason)
-		res.AIC = admit.AIC
-		res.PrincipalAuthorization = admit.PrincipalAuthorization
-		res.Principal = admit.PrincipalUid
-		res.OperationDecisions = admit.OperationDecisions
-		return res
+		return denyWithAdmission(deny, admit)
 	}
 
 	// Parameter-level boundary validation: AIC-declared parameters must not
@@ -428,7 +426,28 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		for _, cap := range admit.EffectiveCaps {
 			p, err := pluginReg.Find(cap.SchemeId)
 			if err != nil {
-				// Scheme has no plugin = gateway does not serve this declaration → ignore
+				// A capability the current request requires, but whose scheme
+				// this gateway does not serve, MUST be refused: draft-wei-aic-
+				// identity-cert-02 - "When the capability required by the
+				// current request references an unknown scheme or an unknown
+				// capability, the request MUST be treated as Deny (fail-
+				// closed)."  Cert-carried capabilities that are not required
+				// stay ignored (same sentence, second half).
+				if requiredCapUnserved(cfg.RequiredCapabilities, cap) {
+					LogPluginDecision(cfg.AuditLogger, PluginAuditEntry{
+						Scheme:        cap.SchemeId,
+						CapabilityID:  cap.CapabilityId,
+						Decision:      "deny",
+						Reason:        fmt.Sprintf("required capability %q uses scheme %q, which this gateway does not serve", cap.CapabilityId, cap.SchemeId),
+						ClientCN:      clientCert.Subject.CommonName,
+						Principal:     admit.PrincipalUid,
+						Level:         "WARN",
+						DaHash:        daHash,
+						PolicyVersion: policyVersion,
+					})
+					return deny(fmt.Sprintf("required capability %q uses unserved scheme %q", cap.CapabilityId, cap.SchemeId))
+				}
+				// Scheme has no plugin = gateway does not serve this declaration -> ignore
 				// (spec: Ignore, not Deny)
 				LogPluginDecision(cfg.AuditLogger, PluginAuditEntry{
 					Scheme:        cap.SchemeId,
@@ -518,33 +537,6 @@ func RunAccessPipeline(chain []*x509.Certificate, cfg *PipelineConfig) *Pipeline
 		OperationDecisions:     admit.OperationDecisions,
 	}
 }
-
-// aggregateCLCDecisions rolls per-operation CLC verdicts into the single
-// verdict surfaced on the admission result.  An empty operation list produces
-// an empty verdict so "no operations configured" stays distinguishable from
-// "all operations allowed".  A released allow_unresolved operation keeps the
-// allow_unresolved verdict — the connection is admitted but the residual
-// obligations must still be honored at runtime (B3).
-func aggregateCLCDecisions(ops []OperationDecision) (verdict, reason string, unresolved []string) {
-	if len(ops) == 0 {
-		return "", "", nil
-	}
-	verdict = semantics.VerdictAllow
-	var reasons []string
-	for _, od := range ops {
-		if od.Verdict != semantics.VerdictAllowUR {
-			continue
-		}
-		verdict = semantics.VerdictAllowUR
-		if od.Reason != "" {
-			reasons = append(reasons, od.Reason)
-		}
-		unresolved = append(unresolved, od.Unresolved...)
-	}
-	reason = strings.Join(reasons, "; ")
-	return verdict, reason, unresolved
-}
-
 func checkCertValidity(cert *x509.Certificate) error {
 	now := time.Now()
 	if now.Before(cert.NotBefore) {
@@ -617,4 +609,19 @@ func CheckOperationCapability(reg *PluginRegistry, cap *Capability, ctx *PluginC
 		return &PluginResult{Decision: PluginDeny, Reason: fmt.Sprintf("scheme %q has no registered plugin: fail-closed", cap.SchemeId)}, nil
 	}
 	return p.Execute(cap, ctx)
+}
+
+// requiredCapUnserved reports whether any capability the current request
+// requires is matched by cap.  It mirrors aicCapabilityMatches so the
+// request-side capability identity is computed the same way in both places.
+func requiredCapUnserved(required []string, cap Capability) bool {
+	for _, req := range required {
+		if MatchCapability(req, cap.CapabilityId) {
+			return true
+		}
+		if cap.SchemeId != "" && MatchCapability(req, cap.SchemeId+":"+cap.CapabilityId) {
+			return true
+		}
+	}
+	return false
 }

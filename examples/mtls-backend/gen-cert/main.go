@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"time"
 
+	aictest "github.com/varwof/aic-verifier/internal/aictest"
 	pki "github.com/varwof/types"
 )
 
@@ -137,7 +138,6 @@ func makeClient(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) (*x50
 		AgentId: "agent-002",
 		PrincipalUid: pki.PrincipalUid{
 			Version: 1, Realm: "example", Identifier: "agent-002",
-			KeyHash: make([]byte, 32),
 		},
 		Capabilities: []pki.Capability{
 			// SchemeId must be the CLC scheme form (vendor/product-vN); the
@@ -148,9 +148,13 @@ func makeClient(dir string, caKey *ecdsa.PrivateKey, ca *x509.Certificate) (*x50
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:             pki.Reason{ReasonCode: "TEST", Description: "mtls example"},
 			Nonce:              make([]byte, 32),
-			RequestedLifetime:  3600,
+			Timestamp:          time.Now().UTC(),
+			RequestedLifetime:  86400,
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
 		},
+	}
+	if err := aictest.SelfAuthorizeDA(key, &aic); err != nil {
+		return nil, err
 	}
 	aicDER, err := asn1.Marshal(aic)
 	if err != nil {

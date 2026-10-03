@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/varwof/register/semantics"
 )
@@ -276,4 +277,221 @@ func normalizeParams(params any) (map[string]any, error) {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// evaluateCLCOperations runs the CLC operation layer: every operation declared
+// in AdmissionConfig.Operations is decided by the CLC core over the effective
+// authority, and the verdicts are appended to result.OperationDecisions.
+//
+// It returns nil to continue admission, or the refusal to return. It is a no-op
+// when no operations are declared, which is the case for every embedder that
+// only uses the capability-id layer.
+//
+// Extracted from decision.go so that file stays line-for-line comparable with
+// gateway-core's decision.go — gateway-core has no CLC layer and therefore no
+// equivalent of this function. See docs/parity-gateway-core.md.
+func evaluateCLCOperations(aic *AIC, result *AdmissionResult, cfg *AdmissionConfig) *AdmissionResult {
+	// denyOp carries the decisions already made into the refusal, so a refusal
+	// is as auditable as an admission: evidence emission and the challenge
+	// carrier both read OperationDecisions, and the result docstring promises
+	// they survive the deny path.
+	denyOp := func(format string, args ...any) *AdmissionResult {
+		return &AdmissionResult{
+			Decision:               DecisionDeny,
+			Reason:                 fmt.Sprintf(format, args...),
+			AIC:                    result.AIC,
+			PrincipalAuthorization: result.PrincipalAuthorization,
+			PrincipalUid:           result.PrincipalUid,
+			OperationDecisions:     result.OperationDecisions,
+		}
+	}
+
+	// The id-only check in CheckAdmission cannot see parameters, so a grant of
+	// {"tables":["a"]} and a request for {"tables":["a","b"]} look identical to
+	// it.  Each declared operation is decided by the CLC core instead, over the
+	// effective authority.
+	for _, op := range cfg.Operations {
+		dec, err := AuthorizeOperation(aic, result.PrincipalAuthorization, op.ID, op.Params)
+		if err != nil {
+			return &AdmissionResult{
+				Decision: DecisionDeny,
+				Reason:   fmt.Sprintf("operation %s: %v", op.ID, err),
+			}
+		}
+		od := OperationDecision{
+			ID:         op.ID,
+			Params:     op.Params,
+			Verdict:    dec.Verdict,
+			Reason:     dec.Reason,
+			Unresolved: dec.Unresolved,
+			Grants:     decisionGrants(aic, result.PrincipalAuthorization),
+		}
+		result.OperationDecisions = append(result.OperationDecisions, od)
+		switch dec.Verdict {
+		case semantics.VerdictAllow:
+			// authorized outright
+			if err := checkDecisionContext(*cfg); err != nil {
+				return denyOp("operation %s: %v", op.ID, err)
+			}
+		case semantics.VerdictDeny:
+			return denyOp("operation %s denied: %s", op.ID, dec.Reason)
+		default:
+			// allow_unresolved is an independent verdict carrying §8.4 residual
+			// obligations; reading it as "allow" would fail open.
+			//
+			// Strict mode first applies the consumer-side rule (XACML §2.13:
+			// deny unless the consumer understands and can discharge every
+			// obligation), then the deployment's value-level confirmation.
+			if cfg.DischargeObligations {
+				if err := semantics.Discharge(dec, cfg.ObligationsUnderstood); err != nil {
+					return denyOp("operation %s: %v", op.ID, err)
+				}
+			}
+			if cfg.UnresolvedEvaluator != nil && cfg.UnresolvedEvaluator(op, dec.Unresolved) {
+				// The deployment confirmed the residual obligations; the operation
+				// is released but must still be honored at runtime. Only opt-in
+				// paths reach here — nil (default) keeps fail-closed deny.
+				if err := checkDecisionContext(*cfg); err != nil {
+					return denyOp("operation %s: %v", op.ID, err)
+				}
+				result.OperationDecisions[len(result.OperationDecisions)-1].Released = true
+				continue
+			}
+			return denyOp("operation %s: %s (unresolved %v)", op.ID, dec.Verdict, dec.Unresolved)
+		}
+	}
+	return nil
+}
+
+// checkDecisionContext enforces the RATS §10 decision-context freshness gate
+// on the operations that were allowed outright or explicitly released.
+func checkDecisionContext(cfg AdmissionConfig) error {
+	if !cfg.RequireFreshDecisionContext {
+		return nil
+	}
+	if cfg.DecisionContext == nil {
+		return semantics.ErrContextMissing
+	}
+	return cfg.DecisionContext.Fresh(time.Now().UTC())
+}
+
+// applyCLCAdmissionConfig copies the CLC-layer fields from the pipeline config
+// onto an AdmissionConfig that was built field-by-field.
+//
+// It exists so the AdmissionConfig literal in pipeline.go and trust_model.go
+// reads the same as gateway-core's, which has no CLC layer and therefore no
+// equivalent of this function. Fields absent from the shared literal must be
+// declared here and nowhere else, or the two drift apart silently.
+func applyCLCAdmissionConfig(dst *AdmissionConfig, src *PipelineConfig) {
+	dst.Operations = src.Operations
+	dst.UnresolvedEvaluator = src.UnresolvedEvaluator
+	dst.DischargeObligations = src.DischargeObligations
+	dst.ObligationsUnderstood = src.ObligationsUnderstood
+	dst.RequireFreshDecisionContext = src.RequireFreshDecisionContext
+	dst.DecisionContext = src.DecisionContext
+	dst.ConstraintRegistry = src.ConstraintRegistry
+}
+
+// ConstraintToCapability is the inverse of ConstraintStrings: it maps a CLC
+// constraint string back to the (scheme, capability, parameters) triple the
+// connection-level registry evaluates.  A string this SDK cannot map is
+// reported as false so callers fail closed.
+func ConstraintToCapability(c string) (Capability, bool) {
+	parts := strings.Split(c, ":")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return Capability{}, false
+	}
+	cap := Capability{SchemeId: parts[0]}
+	switch parts[1] {
+	case "time", "network":
+		// `<scheme>:<type>:<crumb>:<json>` — the crumb ("window"/"cidr") is part
+		// of the capability id in the extension encoding.
+		if len(parts) < 4 {
+			return Capability{}, false
+		}
+		cap.CapabilityId = parts[1] + ":" + parts[2]
+		cap.Parameters = []byte(strings.Join(parts[3:], ":"))
+	default:
+		if len(parts) == 2 {
+			cap.CapabilityId = parts[1]
+			return cap, true
+		}
+		cap.CapabilityId = parts[1]
+		cap.Parameters = []byte(strings.Join(parts[2:], ":"))
+	}
+	return cap, true
+}
+
+// ConnectionConstraintEvaluator returns an UnresolvedEvaluator that discharges
+// the obligations the connection-level constraint registry can evaluate for the
+// given client IP (source CIDRs, time windows, and whatever else is registered).
+//
+// It exists because the connection-level check and the language-level obligation
+// are two halves of one rule: the language *declares* the constraint, and this
+// evaluator *discharges* it.  Passing it is an explicit act — a deployment that
+// does not pass it keeps the §8.4 default, which is fail-closed — so the release
+// is a declared policy rather than an implicit bypass.  Anything the registry
+// cannot evaluate (for example `max_rows`) is not discharged here: return false
+// and let the caller decide.
+func ConnectionConstraintEvaluator(clientIP string) func(op Operation, unresolved []string) bool {
+	return func(_ Operation, unresolved []string) bool {
+		for _, c := range unresolved {
+			cap, ok := ConstraintToCapability(c)
+			if !ok {
+				return false
+			}
+			// The registry must actually have an evaluator for this type: a
+			// successful check for an unknown type only means the non-strict
+			// path ignored it, and ignoring is not discharging.
+			if _, err := globalConstraintRegistry.Find(cap.CapabilityId); err != nil {
+				return false
+			}
+			if err := CheckAuthorizationConstraints([]Capability{cap}, clientIP); err != nil {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// aggregateCLCDecisions rolls per-operation CLC verdicts into the single
+// verdict surfaced on the admission result.  An empty operation list produces
+// an empty verdict so "no operations configured" stays distinguishable from
+// "all operations allowed".  A released allow_unresolved operation keeps the
+// allow_unresolved verdict — the connection is admitted but the residual
+// obligations must still be honored at runtime (B3).
+func aggregateCLCDecisions(ops []OperationDecision) (verdict, reason string, unresolved []string) {
+	if len(ops) == 0 {
+		return "", "", nil
+	}
+	verdict = semantics.VerdictAllow
+	var reasons []string
+	for _, od := range ops {
+		if od.Verdict != semantics.VerdictAllowUR {
+			continue
+		}
+		verdict = semantics.VerdictAllowUR
+		if od.Reason != "" {
+			reasons = append(reasons, od.Reason)
+		}
+		unresolved = append(unresolved, od.Unresolved...)
+	}
+	reason = strings.Join(reasons, "; ")
+	return verdict, reason, unresolved
+}
+
+// denyWithAdmission turns a refused AdmissionResult into a pipeline refusal.
+//
+// A refusal is auditable too: the decisions already made (and the authority they
+// were made over) are carried into the denied result, the same way
+// CheckAdmission does.  Evidence emission and the challenge carrier both read
+// these fields, and an empty list would silently turn a refusal into "nothing to
+// record".
+func denyWithAdmission(deny func(string) *PipelineResult, admit AdmissionResult) *PipelineResult {
+	res := deny(admit.Reason)
+	res.AIC = admit.AIC
+	res.PrincipalAuthorization = admit.PrincipalAuthorization
+	res.Principal = admit.PrincipalUid
+	res.OperationDecisions = admit.OperationDecisions
+	return res
 }

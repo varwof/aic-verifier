@@ -135,6 +135,45 @@ func (ca *httpCA) issueCert(t *testing.T, cn string, aic *pki.AIC, extra []pkix.
 	}
 	extras := append([]pkix.Extension{}, extra...)
 	if aic != nil {
+		// Self-authorized delegation: the agent is its own principal, so the
+		// DA is signed with the leaf key and PrincipalUid.KeyHash is the leaf
+		// SPKI hash.  DA verification is mandatory (draft Section 12 step 4),
+		// and a placeholder signature would (correctly) be refused, so the
+		// fixture has to be genuinely verifiable.
+		spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+		if err != nil {
+			t.Fatalf("marshal spki: %v", err)
+		}
+		keyHash := sha256.Sum256(spki)
+		aic.PrincipalUid.KeyHash = keyHash[:]
+		if aic.DelegationAuthorization.RequestedLifetime == 0 ||
+			aic.DelegationAuthorization.RequestedLifetime < 7200 {
+			// the leaf lives 2h and the certificate validity period must not
+			// exceed requestedLifetime
+			aic.DelegationAuthorization.RequestedLifetime = 86400
+		}
+		daTBS := pki.DelegationAuthTBS{
+			Version:                  aic.Version,
+			AgentId:                  aic.AgentId,
+			PrincipalUid:             aic.PrincipalUid,
+			Reason:                   aic.DelegationAuthorization.Reason,
+			Capabilities:             aic.Capabilities,
+			DelegationMode:           aic.DelegationMode,
+			AuthorizationConstraints: aic.AuthorizationConstraints,
+			RequestedLifetime:        aic.DelegationAuthorization.RequestedLifetime,
+			Timestamp:                aic.DelegationAuthorization.Timestamp,
+			Nonce:                    aic.DelegationAuthorization.Nonce,
+		}
+		daDER, err := asn1.Marshal(daTBS)
+		if err != nil {
+			t.Fatalf("marshal delegation TBS: %v", err)
+		}
+		daDigest := sha256.Sum256(daDER)
+		daSig, err := ecdsa.SignASN1(rand.Reader, key, daDigest[:])
+		if err != nil {
+			t.Fatalf("sign delegation TBS: %v", err)
+		}
+		aic.DelegationAuthorization.SignatureValue = daSig
 		aicDER, err := asn1.Marshal(*aic)
 		if err != nil {
 			t.Fatalf("marshal AIC: %v", err)

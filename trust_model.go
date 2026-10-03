@@ -109,31 +109,28 @@ func VerifyLayer2(chain []*x509.Certificate, cfg *PipelineConfig, roles []string
 		return AdmissionResult{}, &Layer2Result{Reason: "no client certificate presented"}
 	}
 	clientCert := chain[0]
-	admit := CheckAdmission(clientCert, AdmissionConfig{
-		RequireAIC:                  cfg.RequireAIC,
-		RequiredProtocol:            cfg.RequiredProtocol,
-		RequiredRuleId:              cfg.RequiredRuleId,
-		RequiredCapabilities:        cfg.RequiredCapabilities,
-		Operations:                  cfg.Operations,
-		UnresolvedEvaluator:         cfg.UnresolvedEvaluator,
-		DischargeObligations:        cfg.DischargeObligations,
-		ObligationsUnderstood:       cfg.ObligationsUnderstood,
-		RequireFreshDecisionContext: cfg.RequireFreshDecisionContext,
-		DecisionContext:             cfg.DecisionContext,
-		DisallowRepresentative:      cfg.DisallowRepresentative,
-		RequireUserPermission:       cfg.RequireUserPermission,
-		RejectOverflow:              cfg.RejectOverflow,
-		RequireUserAuth:             cfg.RequireUserAuth,
-		EnforceCapSizeConstraints:   cfg.EnforceCapSizeConstraints,
-		EnforceSize32:               cfg.EnforceSize32,
-		NonceCache:                  cfg.NonceCache,
-		UserCert:                    cfg.UserCert,
-		UserCertResolver:            cfg.UserCertResolver,
-		ClientIP:                    cfg.ClientIP,
-		EnforceConstraints:          cfg.EnforceConstraints,
-		StrictConstraints:           cfg.StrictConstraints,
-		AuditLogger:                 cfg.AuditLogger,
-	})
+	ac := AdmissionConfig{
+		RequireAIC:                     cfg.RequireAIC,
+		RequiredProtocol:               cfg.RequiredProtocol,
+		RequiredRuleId:                 cfg.RequiredRuleId,
+		RequiredCapabilities:           cfg.RequiredCapabilities,
+		DisallowRepresentative:         cfg.DisallowRepresentative,
+		RequireUserPermission:          cfg.RequireUserPermission,
+		RejectOverflow:                 cfg.RejectOverflow,
+		RequireUserAuth:                cfg.RequireUserAuth,
+		SkipDelegationAuthVerification: cfg.SkipDelegationAuthVerification,
+		EnforceCapSizeConstraints:      cfg.EnforceCapSizeConstraints,
+		EnforceSize32:                  cfg.EnforceSize32,
+		NonceCache:                     cfg.NonceCache,
+		UserCert:                       cfg.UserCert,
+		UserCertResolver:               cfg.UserCertResolver,
+		ClientIP:                       cfg.ClientIP,
+		EnforceConstraints:             cfg.EnforceConstraints,
+		StrictConstraints:              cfg.StrictConstraints,
+		AuditLogger:                    cfg.AuditLogger,
+	}
+	applyCLCAdmissionConfig(&ac, cfg)
+	admit := CheckAdmission(clientCert, ac)
 	res := &Layer2Result{
 		AIC:                    admit.AIC,
 		PrincipalAuthorization: admit.PrincipalAuthorization,

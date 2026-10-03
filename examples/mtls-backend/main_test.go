@@ -29,6 +29,7 @@ import (
 
 	"github.com/varwof/aic-verifier"
 	"github.com/varwof/aic-verifier/examples/supervision-demo"
+	aictest "github.com/varwof/aic-verifier/internal/aictest"
 	pki "github.com/varwof/types"
 )
 
@@ -108,6 +109,10 @@ func writePEMFile(t *testing.T, path, typ string, der []byte) {
 // given capabilities (gen-cert / root-package mint style).
 func (ca *mtlsCA) issue(t *testing.T, cn string, caps []pki.Capability) tls.Certificate {
 	t.Helper()
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("leaf key: %v", err)
+	}
 	aic := pki.AIC{
 		Version: 1,
 		AgentId: cn,
@@ -115,26 +120,23 @@ func (ca *mtlsCA) issue(t *testing.T, cn string, caps []pki.Capability) tls.Cert
 			Version:    1,
 			Realm:      "example",
 			Identifier: cn,
-			KeyHash:    make([]byte, 32),
 			HashAlgo:   pki.AlgorithmIdentifier{Algorithm: pki.OIDSHA256},
 		},
 		Capabilities: caps,
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:             pki.Reason{ReasonCode: "TEST", Description: "mtls example"},
 			Nonce:              make([]byte, 32),
-			RequestedLifetime:  3600,
+			RequestedLifetime:  86400,
 			Timestamp:          time.Now().UTC(),
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
-			SignatureValue:     []byte{0x01},
 		},
+	}
+	if err := aictest.SelfAuthorizeDA(leafKey, &aic); err != nil {
+		t.Fatalf("self-authorize DA: %v", err)
 	}
 	aicDER, err := asn1.Marshal(aic)
 	if err != nil {
 		t.Fatalf("marshal AIC: %v", err)
-	}
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("leaf key: %v", err)
 	}
 	leafTpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),

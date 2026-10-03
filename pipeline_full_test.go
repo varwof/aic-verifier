@@ -45,15 +45,16 @@ func testSPIFFECert(t *testing.T, trustDomain, agentID string) *x509.Certificate
 		AgentId: agentID,
 		PrincipalUid: pki.PrincipalUid{
 			Version: 1, Realm: "pki", Identifier: agentID,
-			KeyHash: make([]byte, 32), HashAlgo: pki.AlgorithmIdentifier{Algorithm: pki.OIDSHA256},
+			HashAlgo: pki.AlgorithmIdentifier{Algorithm: pki.OIDSHA256},
 		},
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:    pki.Reason{ReasonCode: "test", Description: "spiffe test"},
 			Timestamp: time.Now().UTC(), Nonce: make([]byte, 32),
+			RequestedLifetime:  86400,
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
-			SignatureValue:     []byte{0x01},
 		},
 	}
+	selfAuthorizeDA(t, key, aic)
 	aicDER, err := asn1.Marshal(*aic)
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +94,7 @@ func testAICWithPACert(t *testing.T) *x509.Certificate {
 		AgentId: "agent-1",
 		PrincipalUid: pki.PrincipalUid{
 			Version: 1, Realm: "pki", Identifier: "user-1",
-			KeyHash: make([]byte, 32), HashAlgo: pki.AlgorithmIdentifier{Algorithm: pki.OIDSHA256},
+			HashAlgo: pki.AlgorithmIdentifier{Algorithm: pki.OIDSHA256},
 		},
 		Capabilities: []pki.Capability{{
 			SchemeId:     "std/database-v1",
@@ -102,13 +103,13 @@ func testAICWithPACert(t *testing.T) *x509.Certificate {
 		}},
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:             pki.Reason{ReasonCode: "test", Description: "pipeline test"},
-			RequestedLifetime:  3600,
+			RequestedLifetime:  86400,
 			Timestamp:          time.Now().UTC(),
 			Nonce:              make([]byte, 32),
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
-			SignatureValue:     []byte{0x01},
 		},
 	}
+	selfAuthorizeDA(t, key, aic)
 	aicDER, err := asn1.Marshal(*aic)
 	if err != nil {
 		t.Fatal(err)

@@ -5,10 +5,12 @@ package aicverifier
 
 import (
 	"context"
+	"crypto/x509"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -259,5 +261,36 @@ func TestServerListenAndServeClose(t *testing.T) {
 
 	if err := s.Close(ctx); err != nil {
 		t.Errorf("second Close must succeed on a shutdown server: %v", err)
+	}
+}
+
+// TestPipelineRequiredCapabilityUnknownSchemeDenied pins draft-wei-aic-identity
+// -cert-02: "When the capability required by the current request references an
+// unknown scheme or an unknown capability, the request MUST be treated as Deny
+// (fail-closed)."  A capability declared by the certificate but not required by
+// the request stays ignored, per the same sentence's second half.
+func TestPipelineRequiredCapabilityUnknownSchemeDenied(t *testing.T) {
+	cert := testAICWithPACert(t) // declares std/database-v1:query:SELECT
+	emptyReg := NewPluginRegistry()
+
+	// Required capability whose scheme has no plugin -> deny.
+	r := RunAccessPipeline([]*x509.Certificate{cert}, &PipelineConfig{
+		RequiredCapabilities:     []string{"std/database-v1:query:SELECT"},
+		CapabilityPluginRegistry: emptyReg,
+	})
+	if r.Granted {
+		t.Fatalf("required capability with unserved scheme was admitted")
+	}
+	if !strings.Contains(r.DenyReason, "unserved scheme") {
+		t.Fatalf("deny reason = %q, want an unserved-scheme refusal", r.DenyReason)
+	}
+
+	// Same certificate, no required capability -> the unserved declaration is
+	// ignored, not denied.
+	r2 := RunAccessPipeline([]*x509.Certificate{cert}, &PipelineConfig{
+		CapabilityPluginRegistry: emptyReg,
+	})
+	if !r2.Granted {
+		t.Fatalf("irrelevant unserved declaration must be ignored, got %s", r2.DenyReason)
 	}
 }

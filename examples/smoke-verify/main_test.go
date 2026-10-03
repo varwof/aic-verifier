@@ -8,7 +8,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -24,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	aictest "github.com/varwof/aic-verifier/internal/aictest"
 	pki "github.com/varwof/types"
 )
 
@@ -75,21 +75,22 @@ func mintClient(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate,
 	}
 	var extras []pkix.Extension
 	if withAIC {
-		subjectKey, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
-		keyHash := sha256.Sum256(subjectKey)
 		aic := pki.AIC{
 			Version: 1,
 			AgentId: cn,
 			PrincipalUid: pki.PrincipalUid{
-				Version: 1, Realm: "example", Identifier: cn, KeyHash: keyHash[:],
+				Version: 1, Realm: "example", Identifier: cn,
 			},
 			Capabilities: caps,
 			DelegationAuthorization: pki.DelegationAuthorization{
 				Reason:             pki.Reason{ReasonCode: "operator-request", Description: "smoke-verify test"},
 				Nonce:              make([]byte, 32),
-				RequestedLifetime:  3600,
+				RequestedLifetime:  86400,
 				SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
 			},
+		}
+		if err := aictest.SelfAuthorizeDA(key, &aic); err != nil {
+			t.Fatal(err)
 		}
 		aicDER, err := asn1.Marshal(aic)
 		if err != nil {

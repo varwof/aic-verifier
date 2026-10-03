@@ -16,7 +16,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -51,13 +50,18 @@ func testAICCert(t testing.TB, withWindow bool) *x509.Certificate {
 			Parameters:   []byte(`[{"start":"00:00","end":"06:00"}]`),
 		})
 	}
+	// Self-authorized fixture: the delegation principal IS the agent, so the
+	// DA is signed by the certificate's own key and PrincipalUid.KeyHash is
+	// that certificate's SPKI hash.  This keeps the whole shared suite on the
+	// strict default path (DA verification is mandatory, draft Section 12
+	// step 4) instead of opting out, and it is the shape the admission code
+	// accepts when the peer certificate is itself the authorized principal.
 	aic := &pki.AIC{
 		AgentId: "agent-1",
 		PrincipalUid: pki.PrincipalUid{
 			Version:    1,
 			Realm:      "pki",
 			Identifier: "user-1",
-			KeyHash:    make([]byte, sha256.Size),
 			HashAlgo:   pki.AlgorithmIdentifier{Algorithm: pki.OIDSHA256},
 		},
 		Capabilities: []pki.Capability{{
@@ -68,13 +72,13 @@ func testAICCert(t testing.TB, withWindow bool) *x509.Certificate {
 		AuthorizationConstraints: constraints,
 		DelegationAuthorization: pki.DelegationAuthorization{
 			Reason:             pki.Reason{ReasonCode: "API_ISSUE", Description: "test"},
-			RequestedLifetime:  3600,
+			RequestedLifetime:  86400,
 			Timestamp:          time.Now().UTC(),
 			Nonce:              make([]byte, 32),
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
-			SignatureValue:     []byte{0x01},
 		},
 	}
+	selfAuthorizeDA(t, key, aic)
 	aicDER, err := asn1.Marshal(*aic)
 	if err != nil {
 		t.Fatalf("marshal aic: %v", err)

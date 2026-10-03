@@ -122,7 +122,7 @@ func (a *authenticator) decide(ctx context.Context, view *RequestView) (*AuthCon
 		}
 	}
 
-	result := RunAccessPipeline(chain, a.pipelineConfig(view, view.Body))
+	result := RunAccessPipeline(chain, a.pipelineConfig(view, view.Body, bearer))
 	if !result.Granted {
 		a.log.Warn("aic-verifier: admission denied", "reason", result.DenyReason, "path", view.Path)
 		// A refused operation is evidence too: record the decisions that were
@@ -236,7 +236,13 @@ func (a *authenticator) resolveCredential(view *RequestView) ([]*x509.Certificat
 // the authenticator config plus the view's per-request facts.  A reloaded
 // policy snapshot (ReloadPolicy) wins over the config-level fields; a nil
 // bundle keeps plain config operation, preserving the B isolation exactly.
-func (a *authenticator) pipelineConfig(view *RequestView, opBody []byte) *PipelineConfig {
+//
+// bearer is true when the credential is a synthesized AIC-JWT carrier.  Such a
+// carrier has no X.509 DelegationAuthorization: its delegation is the outer.da
+// claim, already verified by JWTVerifier.VerifyBearer before this point, so the
+// step-4 X.509 DA signature check is skipped rather than run against the
+// neutral placeholder that SynthesizeCertFromJWT installs.
+func (a *authenticator) pipelineConfig(view *RequestView, opBody []byte, bearer bool) *PipelineConfig {
 	pol, cons, vals := a.cfg.AuthorizationPolicy, a.cfg.Constraints, a.cfg.ParameterValidators
 	if b := a.reloadableBundle(); b != nil {
 		if b.Policy != nil {
@@ -250,32 +256,33 @@ func (a *authenticator) pipelineConfig(view *RequestView, opBody []byte) *Pipeli
 		}
 	}
 	return &PipelineConfig{
-		CRLCache:                    a.crl,
-		OCSPCache:                   a.ocsp,
-		CheckScope:                  CheckFullChain,
-		RequireAIC:                  a.cfg.RequireAIC,
-		RequiredCapabilities:        a.cfg.RequiredCapabilities,
-		Operations:                  a.cfg.RequiredOperations,
-		UnresolvedEvaluator:         a.cfg.UnresolvedEvaluator,
-		DischargeObligations:        a.cfg.DischargeObligations,
-		ObligationsUnderstood:       a.cfg.ObligationsUnderstood,
-		RequireFreshDecisionContext: a.cfg.RequireFreshDecisionContext,
-		DecisionContext:             a.cfg.DecisionContext,
-		DisallowRepresentative:      a.cfg.DisallowRepresentative,
-		RequireUserAuth:             a.cfg.RequireUserAuth,
-		ClientIP:                    view.ClientIP,
-		EnforceConstraints:          a.cfg.EnforceConstraints,
-		StrictConstraints:           true,
-		AuthorizationPolicy:         pol,
-		ConstraintRegistry:          cons,
-		ParameterValidators:         vals,
-		CapabilityPluginRegistry:    a.cfg.PluginRegistry,
-		CapabilityRegistry:          a.cfg.CapabilityRegistry,
-		AuditLogger:                 a.audit,
-		NonceCache:                  a.nonceCache,
-		UserCert:                    a.cfg.UserCert,
-		UserCertResolver:            a.cfg.UserCertResolver,
-		HTTPFacts:                   view.httpFacts(opBody),
+		CRLCache:                       a.crl,
+		OCSPCache:                      a.ocsp,
+		CheckScope:                     CheckFullChain,
+		RequireAIC:                     a.cfg.RequireAIC,
+		RequiredCapabilities:           a.cfg.RequiredCapabilities,
+		Operations:                     a.cfg.RequiredOperations,
+		UnresolvedEvaluator:            a.cfg.UnresolvedEvaluator,
+		DischargeObligations:           a.cfg.DischargeObligations,
+		ObligationsUnderstood:          a.cfg.ObligationsUnderstood,
+		RequireFreshDecisionContext:    a.cfg.RequireFreshDecisionContext,
+		DecisionContext:                a.cfg.DecisionContext,
+		DisallowRepresentative:         a.cfg.DisallowRepresentative,
+		RequireUserAuth:                a.cfg.RequireUserAuth,
+		SkipDelegationAuthVerification: bearer,
+		ClientIP:                       view.ClientIP,
+		EnforceConstraints:             a.cfg.EnforceConstraints,
+		StrictConstraints:              true,
+		AuthorizationPolicy:            pol,
+		ConstraintRegistry:             cons,
+		ParameterValidators:            vals,
+		CapabilityPluginRegistry:       a.cfg.PluginRegistry,
+		CapabilityRegistry:             a.cfg.CapabilityRegistry,
+		AuditLogger:                    a.audit,
+		NonceCache:                     a.nonceCache,
+		UserCert:                       a.cfg.UserCert,
+		UserCertResolver:               a.cfg.UserCertResolver,
+		HTTPFacts:                      view.httpFacts(opBody),
 	}
 }
 
