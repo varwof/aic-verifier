@@ -37,6 +37,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/varwof/aic-verifier/internal/aictest"
 	"github.com/varwof/register/semantics"
 	pki "github.com/varwof/types"
 )
@@ -215,6 +216,9 @@ func (ca *certAuthority) issueAIC(t *testing.T, agentID string, caps, constraint
 			SignatureAlgorithm: pki.AlgorithmIdentifier{Algorithm: pki.OIDSigECDSAWithSHA256},
 			SignatureValue:     []byte{0x01},
 		},
+	}
+	if err := aictest.SelfAuthorizeDA(key, &aic); err != nil {
+		t.Fatalf("self-authorize DA: %v", err)
 	}
 	aicDER, err := asn1.Marshal(aic)
 	if err != nil {
